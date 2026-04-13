@@ -112,7 +112,7 @@ def run_test():
         gps_flags.append(gps_ok)
  
         # Keypoint kalitesini takip et
-        kp_count = len(estimator.prev_keypoints) if estimator.prev_keypoints is not None else 0
+        kp_count = len(estimator.prev_kp) if estimator.prev_kp is not None else 0
         flow_qualities.append(kp_count)
  
         if i % 100 == 0:
