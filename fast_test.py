@@ -290,8 +290,8 @@ def main():
 
     # ── Grafik ──────────────────────────────────────────────────────────────
     print("Grafik çiziliyor...")
-    fig = plt.figure(figsize=(18, 12))
-    gs = fig.add_gridspec(2, 6)
+    fig = plt.figure(figsize=(18, 18))
+    gs = fig.add_gridspec(3, 6)
 
     # Sol Üst: Yörünge
     ax = fig.add_subplot(gs[0, :3])
@@ -353,7 +353,7 @@ def main():
     else:
         ax2.legend(loc="upper right", fontsize=8)
 
-    # Alt Satır: X, Y, Z Grafikleri
+    # Orta Satır: X, Y, Z Grafikleri
     ax_x = fig.add_subplot(gs[1, 0:2])
     ax_y = fig.add_subplot(gs[1, 2:4])
     ax_z = fig.add_subplot(gs[1, 4:6])
@@ -374,6 +374,23 @@ def main():
         a.set_title(f"Zamana Göre {label} Değişimi")
         a.grid(True, alpha=0.3)
         a.legend(fontsize=8)
+        
+    # Alt Satır: 3 Boyutlu Grafikler
+    ax_3d = fig.add_subplot(gs[2, 1:5], projection='3d')
+    if has_gps_reference:
+        ax_3d.plot(gt_x, gt_y, gt_z, label="GT (Gerçek Rota)", color="blue", linewidth=2, alpha=0.8)
+        
+    ax_3d.plot(pred_x, pred_y, pred_z, label="VO (Tahmin)", color="red", linewidth=2, alpha=0.8, linestyle="--")
+    
+    if has_gps_reference and gps_cut_frame is not None and gps_cut_frame < len(gt_x):
+        ax_3d.scatter(gt_x[gps_cut_frame], gt_y[gps_cut_frame], gt_z[gps_cut_frame],
+                      color="green", s=100, zorder=5, label="GPS Kesintisi")
+                      
+    ax_3d.set_xlabel("X (m)")
+    ax_3d.set_ylabel("Y (m)")
+    ax_3d.set_zlabel("Z (m)")
+    ax_3d.set_title("3 Boyutlu Yörünge Karşılaştırması")
+    ax_3d.legend()
 
     if cap is not None:
         cap.release()
