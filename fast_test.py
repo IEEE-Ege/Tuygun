@@ -331,7 +331,12 @@ def main():
     if has_gps_reference:
         ax.legend()
     ax.grid(True)
-    ax.axis("equal")
+    all_x = np.concatenate([gt_x, pred_x])
+    all_y = np.concatenate([gt_y, pred_y])
+    margin = 30
+    ax.set_xlim([np.min(all_x)-margin, np.max(all_x)+margin])
+    ax.set_ylim([np.min(all_y)-margin, np.max(all_y)+margin])
+    ax.set_aspect('equal', adjustable='datalim')
 
     # Sağ Üst: Confidence zaman serisi (+ hata varsa)
     ax2 = fig.add_subplot(gs[0, 3:])
@@ -371,8 +376,8 @@ def main():
     if n > 1:
         # Puanları 3D scatter olarak veya çizgi olarak çizebiliriz.
         # Basitlik için düz çizgi ve renkli scatter kullanıyoruz.
-        sc = ax4.scatter(pred_x, pred_y, pred_z, c=conf_list, cmap="RdYlGn", vmin=0, vmax=1, s=10, label="Tahmini Rota (VO)")
-        ax4.plot(pred_x, pred_y, pred_z, color="gray", linewidth=0.5, alpha=0.5)
+        sc = ax4.scatter(pred_x, pred_y, pred_z, c=conf_list, cmap="RdYlGn", vmin=0, vmax=1, s=2, alpha=0.8, label="Tahmini Rota (VO)")
+        ax4.plot(pred_x, pred_y, pred_z, color="gray", linewidth=0.5, alpha=0.3)
         fig.colorbar(sc, ax=ax4, label="Confidence", pad=0.1)
 
     if has_gps_reference and gps_cut_frame is not None and gps_cut_frame < len(gt_x):
