@@ -195,10 +195,9 @@ class MonocularVO:
             return  # yeterli bilgi yok
 
         # Yaw: afin matrisin rotasyon bileşeni
-        # Yaw: afin matrisin rotasyon bileşeni
         # M = cur->ref dönüşümü, drone CW döndüğünde M CCW açısı verir.
         yaw = math.atan2(m[1, 0], m[0, 0])
-        # Soft deadband: 0.02 derece altındaki dönüşleri tamamen gürültü kabul et ve çıkar
+        # Soft deadband: 0.02 derece altındaki dönüşleri tamamen gürültü (sistematik hata) kabul et
         deadband = math.radians(0.02)
         if abs(yaw) < deadband:
             yaw = 0.0
@@ -326,17 +325,17 @@ class MonocularVO:
             score *= max(1.0 - penalty, 0.0)
 
         if self.last_pixel_velocity * self.pixel_to_meter > self.THRESH_MAX_VEL_MF:
-            score *= 0.1
+            score *= 0.3
 
         if self.dr_frame_count > self.THRESH_MAX_DR_FRAMES:
-            decay = max(1.0 - (self.dr_frame_count - self.THRESH_MAX_DR_FRAMES) / 500.0, 0.1)
+            decay = max(1.0 - (self.dr_frame_count - self.THRESH_MAX_DR_FRAMES) / 2000.0, 0.6)
             score *= decay
 
         # Birikimli yaw penaltısı: heading gürültüsünün birikmesi konum belirsizliği yaratır
         if self.accumulated_dr_yaw > self.THRESH_ACCUM_YAW:
             excess = self.accumulated_dr_yaw - self.THRESH_ACCUM_YAW
-            # Her ek 180°'lik birikim için 30% düşüş, minimum 0.15
-            yaw_decay = max(1.0 - (excess / math.pi) * 0.3, 0.15)
+            # Her ek 180°'lik birikim için 15% düşüş, minimum 0.6
+            yaw_decay = max(1.0 - (excess / math.pi) * 0.15, 0.6)
             score *= yaw_decay
 
         return float(np.clip(score, 0.0, 1.0))
