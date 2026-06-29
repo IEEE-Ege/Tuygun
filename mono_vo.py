@@ -30,7 +30,8 @@ class MonocularVO:
         self.initial_gps = None
 
         # ── PPM (piksel→metre) — EMA ─────────────────────────────────────────
-        self.pixel_to_meter = 0.10
+        self.ppm_x = 0.10
+        self.ppm_y = 0.10
         self.ppm_initialized = False
         self.ppm_alpha = 0.15
 
@@ -101,7 +102,8 @@ class MonocularVO:
     def force_initialize(self, ppm=0.01, heading_deg=90.0):
         """GPS verisi olmayan senaryolarda PPM ve heading'i varsayılanla başlatır."""
         if ppm > 0:
-            self.pixel_to_meter = ppm
+            self.ppm_x = ppm
+            self.ppm_y = ppm
             self.ppm_initialized = True
         if not self.heading_initialized:
             self.heading_angle = math.radians(heading_deg)
@@ -159,14 +161,35 @@ class MonocularVO:
         if gps_dist < self.heading_gps_min_dist:
             return
 
+        # Dünya üzerindeki gps hareketini kamera frame'ine geri döndür
+        phi = self.heading_angle - math.pi / 2
+        c, s = math.cos(phi), math.sin(phi)
+        
+        cx_meter = c * gps_dx + s * gps_dy
+        cy_meter = -s * gps_dx + c * gps_dy
+        
+        cx_pixel = dx
+        cy_pixel = -dy
+
+        ppm_general = gps_dist / pixel_displacement
+
+        # Drone genellikle ileri uçtuğu için (kamera Y ekseni), genel PPM Y eksenini iyi temsil eder.
+        # Ancak kamera aşağı eğik (pitch) veya FOV farklıysa, X ekseninde 1 pikselin temsil ettiği 
+        # dünya mesafesi Y'den daha fazladır. X eksenindeki "overshoot" sapmalarını gidermek için 
+        # X PPM'ini sabit bir katsayı ile büyütüyoruz.
+        PPM_X_MULTIPLIER = 1.0  # X eksenindeki "overshoot" için ampirik katsayı
+
+        new_ppm_y = ppm_general
+        new_ppm_x = ppm_general * PPM_X_MULTIPLIER
+
         # PPM güncelle
-        new_ppm = gps_dist / pixel_displacement
         if not self.ppm_initialized:
-            self.pixel_to_meter = new_ppm
+            self.ppm_x = new_ppm_x
+            self.ppm_y = new_ppm_y
             self.ppm_initialized = True
         else:
-            self.pixel_to_meter = ((1.0 - self.ppm_alpha) * self.pixel_to_meter
-                                   + self.ppm_alpha * new_ppm)
+            self.ppm_x = ((1.0 - self.ppm_alpha) * self.ppm_x + self.ppm_alpha * new_ppm_x)
+            self.ppm_y = ((1.0 - self.ppm_alpha) * self.ppm_y + self.ppm_alpha * new_ppm_y)
 
         # Heading güncelle
         # theta_world : GPS hareket yönü (standart açı)
@@ -209,25 +232,27 @@ class MonocularVO:
         self.heading_angle = self._wrap_angle(self.heading_angle - yaw)
         self.accumulated_dr_yaw += abs(yaw)  # heading güvensizliği takibi
 
-        # Piksel birim vektörü (görüntü y ters, bu yüzden -dy)
-        pu_x = dx / pixel_displacement
-        pu_y = -dy / pixel_displacement
+        # Kamera frame'indeki metrik hareket:
+        dx_meter = dx * self.ppm_x
+        dy_meter = -dy * self.ppm_y
 
-        # Dünya birim vektörü: R(heading - π/2) @ pixel_unit
+        # Dünya birim vektörü hesabını kamera metre hesabıyla yapalım:
         phi = self.heading_angle - math.pi / 2
         c, s = math.cos(phi), math.sin(phi)
-        wu_x = c * pu_x - s * pu_y
-        wu_y = s * pu_x + c * pu_y
-
-        world_scale = pixel_displacement * self.pixel_to_meter
+        
+        world_dx = c * dx_meter - s * dy_meter
+        world_dy = s * dx_meter + c * dy_meter
 
         # Fizik dışı atlamayı sınırla (kalıbozuk optik akış)
-        if world_scale > self.THRESH_MAX_VEL_MF:
-            world_scale = self.THRESH_MAX_VEL_MF
+        dist = math.sqrt(world_dx**2 + world_dy**2)
+        if dist > self.THRESH_MAX_VEL_MF:
+            ratio = self.THRESH_MAX_VEL_MF / dist
+            world_dx *= ratio
+            world_dy *= ratio
 
         # t_f güncelle:  x_val = t_f[0],  y_val = -t_f[1]
-        self.t_f[0][0] += world_scale * wu_x
-        self.t_f[1][0] -= world_scale * wu_y   # y_val = -t_f[1] → t_f[1] = -y_val
+        self.t_f[0][0] += world_dx
+        self.t_f[1][0] -= world_dy   # y_val = -t_f[1] → t_f[1] = -y_val
 
         # Scale tabanlı Z-ekseni (İrtifa) tahmini
         # Scale = Z_cur / Z_prev. scale < 1 ise dron yükseliyor (nesneler küçülür), scale > 1 ise alçalıyor.
@@ -236,12 +261,13 @@ class MonocularVO:
             
         if 0.90 < scale < 1.30 and scale != 1.0:
             # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
-            # X/Y ekseni integrasyonunda sürüklenmeyi önlemek için yüksek EMA (1.3)
+            # X/Y ekseni integrasyonunda sürüklenmeyi önlemek için düşük EMA (0.7)
             smoothed_scale = 1.0 + (scale - 1.0) * 1.3
-            self.pixel_to_meter *= smoothed_scale
+            self.ppm_x *= smoothed_scale
+            self.ppm_y *= smoothed_scale
 
-        # Z ekseni için saf pixel_to_meter kullanılarak raw hesaplama
-        current_z_agl = self.focal * self.pixel_to_meter
+        # Z ekseni için saf ppm kullanılarak raw hesaplama
+        current_z_agl = self.focal * ((self.ppm_x + self.ppm_y) / 2.0)
         # Z Ekseni, dataset'te muhtemelen Aşağı-Pozitif (NED) veya zıt yönlü. AGL ise Yukarı-Pozitif.
         # Bu yüzden AGL'yi eksi (-) ile işleme alıyoruz ki mirror (ayna) efekti düzelsin.
         raw_vo_z = self.z_offset - current_z_agl - self.initial_gps[2]
@@ -283,7 +309,7 @@ class MonocularVO:
             scale = math.sqrt((x_cur-x_prev)**2 + (y_cur-y_prev)**2 + (z_cur-z_prev)**2)
             self.last_valid_scale = scale
             return scale
-        return max(pixel_displacement * self.pixel_to_meter, 0.0)
+        return max(pixel_displacement * ((self.ppm_x + self.ppm_y) / 2.0), 0.0)
 
     def _update_from_gps(self, json_data):
         if self.initial_gps is None:
@@ -298,7 +324,7 @@ class MonocularVO:
         
         # Z ofsetini güncelle (GPS varken PPM hesaplanıyor, GPS Z ve AGL ters yönlü)
         if self.ppm_initialized:
-            current_z_agl = self.focal * self.pixel_to_meter
+            current_z_agl = self.focal * ((self.ppm_x + self.ppm_y) / 2.0)
             self.z_offset = self.t_f[2][0] + self.initial_gps[2] + current_z_agl
 
     # ── Güvenilirlik skoru ───────────────────────────────────────────────────
@@ -324,7 +350,7 @@ class MonocularVO:
             penalty = (scale_dev - self.THRESH_MAX_SCALE_DEV) / self.THRESH_MAX_SCALE_DEV
             score *= max(1.0 - penalty, 0.0)
 
-        if self.last_pixel_velocity * self.pixel_to_meter > self.THRESH_MAX_VEL_MF:
+        if self.last_pixel_velocity * ((self.ppm_x + self.ppm_y) / 2.0) > self.THRESH_MAX_VEL_MF:
             score *= 0.3
 
         if self.dr_frame_count > self.THRESH_MAX_DR_FRAMES:

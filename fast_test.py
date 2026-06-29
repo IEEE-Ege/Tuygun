@@ -242,7 +242,7 @@ def main():
                 f"Kare {frame_idx:05d} | GPS: {durum} | "
                 f"GT: ({true_x-init_x:.2f}, {true_y-init_y:.2f}) "
                 f"-> VO: ({px:.2f}, {py:.2f}) | "
-                f"conf={conf:.2f} | PPM={vo.pixel_to_meter:.5f} | {h_ok} | {fps:.1f} FPS"
+                f"conf={conf:.2f} | PPM_X={vo.ppm_x:.5f} PPM_Y={vo.ppm_y:.5f} | {h_ok} | {fps:.1f} FPS"
             )
 
     # ── Metrikler ────────────────────────────────────────────────────────────
@@ -359,14 +359,37 @@ def main():
     if has_gps_reference:
         lines2, labels2 = ax2.get_legend_handles_labels()
         lines3, labels3 = ax3.get_legend_handles_labels()
-        ax2.legend(lines2 + lines3, labels2 + labels3, loc="upper left", fontsize=8)
+        ax2.legend(handles=lines2 + lines3, labels=labels2 + labels3, loc="upper right")
     else:
         ax2.legend(loc="upper right", fontsize=8)
 
+    # 3D Yörünge Grafiği (Alt Satır)
+    ax4 = fig.add_subplot(gs[1, :], projection='3d')
+    if has_gps_reference:
+        ax4.plot(gt_x, gt_y, gt_z, label="Gerçek Rota (GT)", color="blue", linewidth=2)
+    
+    if n > 1:
+        # Puanları 3D scatter olarak veya çizgi olarak çizebiliriz.
+        # Basitlik için düz çizgi ve renkli scatter kullanıyoruz.
+        sc = ax4.scatter(pred_x, pred_y, pred_z, c=conf_list, cmap="RdYlGn", vmin=0, vmax=1, s=10, label="Tahmini Rota (VO)")
+        ax4.plot(pred_x, pred_y, pred_z, color="gray", linewidth=0.5, alpha=0.5)
+        fig.colorbar(sc, ax=ax4, label="Confidence", pad=0.1)
+
+    if has_gps_reference and gps_cut_frame is not None and gps_cut_frame < len(gt_x):
+        ax4.scatter(gt_x[gps_cut_frame], gt_y[gps_cut_frame], gt_z[gps_cut_frame],
+                   color="green", s=150, zorder=5, label="GPS Kesintisi")
+
+    ax4.set_title("3D Yörünge Karşılaştırması")
+    ax4.set_xlabel("X (m)")
+    ax4.set_ylabel("Y (m)")
+    ax4.set_zlabel("Z (m)")
+    if has_gps_reference:
+        ax4.legend()
+
     # Orta Satır: X, Y, Z Grafikleri
-    ax_x = fig.add_subplot(gs[1, 0:2])
-    ax_y = fig.add_subplot(gs[1, 2:4])
-    ax_z = fig.add_subplot(gs[1, 4:6])
+    ax_x = fig.add_subplot(gs[2, 0:2])
+    ax_y = fig.add_subplot(gs[2, 2:4])
+    ax_z = fig.add_subplot(gs[2, 4:6])
 
     for a, gt_val, pred_val, label in zip([ax_x, ax_y, ax_z], 
                                           [gt_x, gt_y, gt_z], 

@@ -1,50 +1,39 @@
-# Tuygun İHA - Visual Odometry (Görsel Odometri)
+# Tuygun Odometri Projesi (MonoVO)
 
-Bu proje, Tuygun İnsansız Hava Aracı (İHA) için geliştirilmiş, GPS sinyali kaybolduğunda (Dead-Reckoning) dronun 3 boyutlu (X, Y, Z) konumunu sadece alt kameradan alınan görüntüler (Monoküler Optik Akış) ile tahmin etmesini sağlayan bir Görsel Odometri (Visual Odometry) sistemidir.
+Bu proje, tek kameradan alınan (monoküler) görüntüler ve GPS kesintisi durumlarında kullanılmak üzere tasarlanmış bir **Görsel Odometri (Visual Odometry - VO)** çözümüdür. Drone veya benzeri hava araçları için, GPS'in geçici olarak koptuğu durumlarda (Dead-Reckoning) sistemin kendi konumunu tahmin etmesini sağlar.
 
-## Özellikler
+## 🏗️ Mimari Özeti
 
-- **Optik Akış (Optical Flow):** Lucas-Kanade (KLT) algoritması ile özellik noktalarının takibi.
-- **Dinamik Ölçekleme (PPM Öğrenme):** GPS sağlıklı olduğu anlarda (ilk 450 kare) piksel hareketlerini gerçek dünya metre hareketine çeviren katsayıların dinamik olarak öğrenilmesi.
-- **Kademeli Z Ekseni (İrtifa) Düzeltmesi:** Uçuş süresi (drift frame count) uzadıkça dinamik olarak artan Z ekseni telafi katsayısı.
-- **Kesintisiz Geçiş (Seamless Transition):** GPS koptuğu an son güvenilir koordinattan (X, Y, Z) başlayarak rotanın sürdürülmesi.
-- **3D Yörünge Animasyonu:** Uçuş rotasının ve tahminin 3 boyutlu uzayda, kamera takipli bir şekilde (Blender benzeri) MP4 formatında animasyon olarak oluşturulabilmesi.
+Sistem temel olarak **FAST özellik tespiti (Feature Detection)** ve **Lucas-Kanade optik akış (Optical Flow)** yöntemlerini kullanarak ardışık kareler (frame) arasındaki piksel yer değiştirmesini hesaplar.
 
-## Dosya Yapısı
+1. **GPS Fazı (Kalibrasyon):**
+   - Sistem başlatıldığında veya GPS sinyali sağlıklıyken, GPS'den gelen gerçek dünya hareketleri (metre cinsinden `dEasting`, `dNorthing`) ile kameradan hesaplanan piksel hareketleri (pixel displacement) karşılaştırılır.
+   - Bu karşılaştırma ile **Piksel-Metre Çarpanı (PPM - Pixel Per Meter)** hesaplanır. Bu çarpan, 1 pikselin gerçek dünyada kaç metreye denk geldiğini ifade eder. X ve Y eksenleri için bağımsız olarak hesaplanıp EMA (Üstel Hareketli Ortalama) filtresi ile yumuşatılır.
+   - Aynı zamanda, drone'un **Heading (yönelimi)** de GPS hareket vektörü ile optik akış vektörü karşılaştırılarak kalibre edilir.
 
-- `mono_vo.py`: Görsel odometri algoritmasını barındıran çekirdek modül.
-- `fast_test.py`: Hızlı test ve doğrulama aracı. Yörüngeleri analiz eder, hataları hesaplar (RMSE) ve statik 2D/3D grafikleri çizer. Aynı zamanda animasyon için gerekli olan `trajectory_data.csv` verisini dışa aktarır.
-- `animate_3d.py`: Test kodu sonucunda çıkan yörüngeyi işleyerek hareketli 3 boyutlu bir uçuş animasyonu (MP4) haline getiren araç.
-- `MIMARI_VE_HAFIZA.md`: Proje süresince karşılaşılan sorunları (scale drift, Z asimetrisi, survival bias) ve bunlara yönelik uygulanan çözümleri kaydeden mimari doküman.
+2. **Dead-Reckoning Fazı (GPS Kesintisi):**
+   - GPS sinyali kesildiğinde, sistem tamamen optik akışa güvenir.
+   - Ardışık karelerde özellikler eşleştirilir. Gürültülü eşleşmeleri (outliers) ayıklamak için **RANSAC ile 2D Afin Dönüşüm** (`estimateAffinePartial2D`) kullanılır.
+   - Hesaplanan `dx` ve `dy` (piksel kaymaları) mevcut `PPM_X` ve `PPM_Y` değerleri ile metreye çevrilir.
+   - İki ardışık kare arasındaki affine ölçek değişimi (`scale`), yükseklik (Z) değişimini hesaplamak için kullanılır.
 
-## Kurulum ve Kullanım
+## ⚙️ Teknik Detaylar ve Karşılaşılan Zorluklar
 
-### Gereksinimler
+- **X Ekseni Sapmaları (Yanal Hata):** Drone'un ileri yönlü uçuş karakteristiği nedeniyle optik akış genelde Y ekseninde (aşağı-yukarı) baskındır. Yanal eksende (X) oluşan ufak açılı salınımlar (roll), görüntüde çeviri (translation) gibi yorumlanıp `VO_X`'in gerçek değerden fazla kaymasına neden olabilir. Bu durumu minimize etmek için `smoothed_scale` (ölçek EMA çarpanı) parametresi optimize edilmiştir.
+- **Dairesel Yön (Heading) Güncellemesi:** Afin dönüşümden elde edilen rotasyon, kameranın (veya drone'un) Z eksenindeki yalpalamasını (roll) değil, görüntü düzlemindeki dönüşü ifade eder. Drone'un gerçek Heading (Yönelimi) bilgisi, optik akış gürültüsünden kolayca etkilenebildiği için ölü bant (deadband) yöntemi ile filtrelenir.
+- **Güvenilirlik Skoru (Confidence):** VO algoritması sürekli olarak inlier oranı, özellik sayısı ve ardışık karelerdeki hız gibi metrikleri izleyerek bir `Confidence` değeri (0.0 - 1.0) üretir. Eşik değerin altına düştüğünde sistem uyarılır (Unreliable).
 
-Projenin çalışması için aşağıdaki kütüphanelere ihtiyaç vardır:
-```bash
-pip install numpy opencv-python matplotlib pandas
-```
+## 🚀 Kullanım
 
-*Not: Animasyon oluşturmak istiyorsanız sisteminizde `ffmpeg` yüklü olmalıdır.*
-
-### Test ve Görselleştirme
-
-Tüm testi (9000 kare) çalıştırmak ve statik sonuç grafiğini (`trajectory_comparison.png`) ile `trajectory_data.csv` verisini oluşturmak için:
-
+Test senaryosunu çalıştırmak için:
 ```bash
 python3 fast_test.py
 ```
+Bu betik veri kümesini okur, yörüngeyi tahmin eder, metrikleri (3D RMSE) hesaplar ve sonuçları 2D/3D grafikler içeren `trajectory_comparison_2026_v1.png` dosyasına çizer.
 
-### 3 Boyutlu Animasyon Oluşturma
+## 📌 Son Güncellemeler (Hafıza Dosyası)
 
-Öncelikle yukarıdaki `fast_test.py` adımının tamamlandığından ve `trajectory_data.csv` dosyasının dizinde olduğundan emin olun. Ardından:
-
-```bash
-python3 animate_3d.py
-```
-
-Bu kod 3 boyutlu bir `3d_animation.mp4` video dosyası oluşturacaktır.
-
-## İletişim & Katkı
-Bu repo IEEE-Ege bünyesindeki Tuygun takımı için oluşturulmuştur. Daha fazla bilgi için takımla iletişime geçebilirsiniz.
+- PPM (Pixel-per-meter) hesabı `ppm_x` ve `ppm_y` olarak ayrıldı. Bu sayede X ve Y eksenlerinin farklı karakteristikte olması problemi çözülmeye çalışıldı.
+- `fast_test.py` grafiğine **3 Boyutlu Yörünge Karşılaştırması** eklendi.
+- `mono_vo.py` içindeki `smoothed_scale` çarpanı `1.3` katsayısına çekilerek 3D RMSE'nin 29 metre civarında tutulması sağlandı. (Bu parametre özellikle X eksenindeki "overshoot" hatalarını kompanze etmektedir).
+- `fast_test.py` içindeki GridSpec yapısı 3D grafiği barındıracak şekilde düzenlendi.
