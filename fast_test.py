@@ -288,6 +288,16 @@ def main():
     if vo.heading_initialized:
         print(f"Son heading          : {math.degrees(vo.heading_angle):.1f}°  (0=Doğu, 90=Kuzey)")
 
+
+    # ── CSV Kaydetme ─────────────────────────────────────────────────────────
+    print("Yörünge verileri trajectory_data.csv olarak kaydediliyor...")
+    import csv
+    with open("trajectory_data.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame", "gt_x", "gt_y", "gt_z", "pred_x", "pred_y", "pred_z", "conf"])
+        for i in range(len(gt_x)):
+            writer.writerow([i, gt_x[i], gt_y[i], gt_z[i], pred_x[i], pred_y[i], pred_z[i], conf_list[i]])
+
     # ── Grafik ──────────────────────────────────────────────────────────────
     print("Grafik çiziliyor...")
     fig = plt.figure(figsize=(18, 18))
