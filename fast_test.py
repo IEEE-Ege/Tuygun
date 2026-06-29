@@ -346,7 +346,7 @@ def main():
             f"3D RMSE : {rmse_3d:.2f} m\n"
             f"Max Hata: {errors_3d.max():.2f} m"
         )
-        fig.text(0.02, 0.98, metrics_text, fontsize=12, va='top', ha='left',
+        fig.text(0.02, 0.50, metrics_text, fontsize=12, va='center', ha='left',
                  bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='gray', alpha=0.9))
 
 
