@@ -235,7 +235,7 @@ class MonocularVO:
         # m = cv2.estimateAffinePartial2D(px_cur, px_ref) -> scale < 1 demek px_cur > px_ref (büyüme var, alçalma)
         scale = math.sqrt(m[0, 0]**2 + m[1, 0]**2)
             
-        if 0.90 < scale < 1.10 and scale != 1.0:
+        if 0.90 < scale < 1.30 and scale != 1.0:
             # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
             # X/Y ekseni integrasyonunda sürüklenmeyi önlemek için yüksek EMA (1.3)
             smoothed_scale = 1.0 + (scale - 1.0) * 1.3
@@ -257,7 +257,12 @@ class MonocularVO:
             # 3.0 çarpanı 450-2000 arasındaki yalancı çukuru (false dip) çok büyütüyordu (V şekli yapıyordu).
             # Çarpanı 1.2'ye düşürerek hem doğru yönde kalmasını hem de yalancı çukurun düzleşmesini sağlıyoruz.
             if delta_z < 0:
-                corrected_delta_z = delta_z * 1.0  
+                # Zamanla biriken "scale drift" (survival bias) nedeniyle Z ekseni alçalmaları giderek
+                # daha fazla under-estimate edilir (az hesaplanır). 
+                # Bunu telafi etmek için dr_frame_count'a bağlı dinamik bir çarpan (1.0 -> 3.0) kullanıyoruz.
+                drift_compensation = min(self.dr_frame_count / 3000.0, 1.0)
+                dynamic_multiplier = 1.0 + drift_compensation * 2.0
+                corrected_delta_z = delta_z * dynamic_multiplier
             else:
                 corrected_delta_z = delta_z * 0.6  # Yükselmeyi / tepeyi küçült (bu iyi çalışıyordu)
                 
