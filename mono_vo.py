@@ -2,270 +2,500 @@ import cv2
 import numpy as np
 import math
 
+
 class MonocularVO:
     def __init__(self, min_num_feat=2000):
         self.min_num_feat = min_num_feat
-        
-        # Görev 3: K Matrisi - İHA kamerasının kalibrasyon matrisi (manuel girilecek boş array)
+
         self.K = np.array([
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 1.0]
         ], dtype=np.float64)
-        
-        # Kamera odak uzaklığı ve optik merkez (K matrisinden alınacak, K doldurulduğunda güncellenmeli)
-        # Örnek değerler, gerçek K matrisi ile ezilmelidir. (C++ kodundan varsayılan alınmıştır)
-        self.focal = 718.8560
-        self.pp = (607.1928, 185.2157)
-        
-        # Değişkenler
-        self.px_ref = None  # Önceki karenin (frame i-1) özellik noktaları
-        self.px_cur = None  # Geçerli karenin (frame i) özellik noktaları
+
+        self.focal = 1388.4
+        self.pp = (954.0, 558.9)
+        self.z_offset = 0.0
+        self.dr_start_z = None
+
+        self.px_ref = None
+        self.px_cur = None
         self.prev_frame = None
         self.cur_frame = None
-        
-        # Global Pose matrisleri (3x3 Rotasyon, 3x1 Translation)
+
         self.R_f = np.eye(3, dtype=np.float64)
         self.t_f = np.zeros((3, 1), dtype=np.float64)
-        
-        # GPS/Telemetri koptuğunda (gps_health_status=0) dead-reckoning yapabilmek için
+
+        # GPS başlangıç konumu
+        self.initial_gps = None
+
+        # ── PPM (piksel→metre) — EMA ─────────────────────────────────────────
+        self.pixel_to_meter = 0.10
+        self.ppm_initialized = False
+        self.ppm_alpha = 0.15
+
+        # ── Heading (yön) takibi ─────────────────────────────────────────────
+        #
+        # heading_angle: drone'un mevcut yönü, standart matematik açısı
+        #   0    = Doğu,  π/2 = Kuzey,  π = Batı,  -π/2 = Güney
+        #
+        # GPS fazında GPS hız vektöründen öğrenilir:
+        #   theta_world = atan2(dGPS_y, dGPS_x)          — dünya yönü
+        #   theta_pixel = atan2(-dy, dx)                  — piksel hareket yönü
+        #   heading_angle = theta_world - theta_pixel + π/2
+        #
+        # Dead-reckoning'de heading dondurulur (yaw güncellenmez).
+        # Optical flow yaw'u nadir kameralar için düşük SNR'lıdır;
+        # birikimli drift, sabit yönden daha büyük hata verir.
+        #
+        # Dönüşüm (piksel → dünya):
+        #   phi = heading_angle - π/2
+        #   pixel_unit = [dx/|d|,  -dy/|d|]   ← görüntü y ekseni ters
+        #   world_unit = R(phi) @ pixel_unit
+        #   world_delta = PPM * |d| * world_unit
+        self.heading_angle = None
+        self.heading_initialized = False
+        self.heading_alpha = 0.15         # EMA ağırlığı (GPS güncellemesi)
+        self.heading_gps_min_dist = 0.05  # GPS deltası bu m'nin altındaysa atla
+        self.heading_pix_min_disp = 3.0   # piksel delta bu px'in altındaysa atla
+
+        # ── Güvenilirlik takibi ──────────────────────────────────────────────
+        self.dead_reckoning_active = False
+        self.dr_frame_count = 0
+        self.last_inlier_ratio = 1.0
+        self.last_feature_count = 0
+        self.last_affine_scale = 1.0
+        self.last_pixel_velocity = 0.0
+        # Birikimli yaw: GPS kesilmesinden bu yana toplam rotasyon (radyan)
+        # Büyük birikim → heading güvensizliği artar
+        self.accumulated_dr_yaw = 0.0
+
+        # Eşikler
+        self.THRESH_INLIER_RATIO  = 0.25
+        self.THRESH_MIN_FEATURES  = 50
+        self.THRESH_MAX_SCALE_DEV = 0.6
+        self.THRESH_MAX_VEL_MF    = 6.0
+        self.THRESH_MAX_DR_FRAMES = 2000
+        # Birikimli yaw eşiği: bu değeri geçince confidence düşmeye başlar
+        self.THRESH_ACCUM_YAW     = math.pi  # 180° birikim
+
+        # Legacy
         self.last_valid_scale = 1.0
-        self.last_valid_velocity = 0.0  # metre/kare (son bilinen hız)
-        self.frames_since_keyframe = 0  # Keyframe'den bu yana geçen kare sayısı
-        self.pixel_to_meter = 0.01  # piksel->metre dönüşüm oranı (GPS'ten öğrenilecek)
-        
-        # JSON verisini takip için
+        self.last_valid_velocity = 0.0
+        self.frames_since_keyframe = 0
+
         self.prev_json_data = None
+        self.keyframe_json = None
         self.is_initialized = False
-        
-        # Feature detector (FAST) - Görev 1
+
+        # ── Detektör ve Parametreler ─────────────────────────────────────────────
         self.detector = cv2.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
-        
-        # KLT parameters
         self.lk_params = dict(winSize=(21, 21),
-                              maxLevel=4, # Hızlı dönüşlerde (Yaw) özellikleri kaybetmemek için piramit seviyesi artırıldı
+                              maxLevel=5,
                               criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
     def update_calibration(self, focal, pp):
-        """K matrisinden hesaplanan kalibrasyon değerlerini günceller."""
         self.focal = focal
         self.pp = pp
 
+    def force_initialize(self, ppm=0.01, heading_deg=90.0):
+        """GPS verisi olmayan senaryolarda PPM ve heading'i varsayılanla başlatır."""
+        if ppm > 0:
+            self.pixel_to_meter = ppm
+            self.ppm_initialized = True
+        if not self.heading_initialized:
+            self.heading_angle = math.radians(heading_deg)
+            self.heading_initialized = True
+
+    # ── Özellik tespiti & takibi ─────────────────────────────────────────────
+
     def feature_detection(self, img):
-        """FAST kullanarak özellik noktalarını tespit eder."""
-        keypoints = self.detector.detect(img, None)
+        h, w = img.shape
+        margin_y = int(h * 0.15)
+        margin_x = int(w * 0.15)
+        mask = np.zeros_like(img)
+        mask[margin_y:h-margin_y, margin_x:w-margin_x] = 255
+        
+        keypoints = self.detector.detect(img, mask=mask)
         if not keypoints:
             return np.empty((0, 2), dtype=np.float32)
-        # Sadece x,y koordinatlarını numpy dizisi olarak döndür
+        keypoints = sorted(keypoints, key=lambda kp: kp.response, reverse=True)[:3000]
         return np.array([kp.pt for kp in keypoints], dtype=np.float32)
 
     def feature_tracking(self, img_ref, img_cur, px_ref):
-        """KLT kullanarak bir kareden diğerine özellikleri takip eder."""
         kp2, st, err = cv2.calcOpticalFlowPyrLK(img_ref, img_cur, px_ref, None, **self.lk_params)
-        
-        # Sadece başarıyla takip edilen noktaları filtrele
         st = st.reshape(st.shape[0])
-        kp1 = px_ref[st == 1]
-        kp2 = kp2[st == 1]
+        return px_ref[st == 1], kp2[st == 1]
+
+    # ── Yardımcılar ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _wrap_angle(a):
+        """Açıyı [-π, π] aralığına taşır."""
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def _circular_ema(self, current, new_val, alpha):
+        """Dairesel EMA: açıları doğru interpolasyonla karıştırır."""
+        delta = self._wrap_angle(new_val - current)
+        return self._wrap_angle(current + alpha * delta)
+
+    # ── GPS fazı: PPM ve heading güncelleme ──────────────────────────────────
+
+    def _update_ppm_and_heading(self, dx, dy, pixel_displacement, json_data):
+        """
+        GPS sağlıklıyken her keyframe geçişinde çağrılır.
+        PPM ve heading_angle'ı GPS + optik akış bilgisiyle günceller.
+        """
+        if (self.keyframe_json is None
+                or pixel_displacement < self.heading_pix_min_disp):
+            return
+
+        kf_x = self.keyframe_json.get("translation_x", 0.0)
+        kf_y = self.keyframe_json.get("translation_y", 0.0)
+        gps_dx = json_data.get("translation_x", 0.0) - kf_x
+        gps_dy = json_data.get("translation_y", 0.0) - kf_y
+        gps_dist = math.sqrt(gps_dx**2 + gps_dy**2)
+
+        if gps_dist < self.heading_gps_min_dist:
+            return
+
+        # PPM güncelle
+        new_ppm = gps_dist / pixel_displacement
+        if not self.ppm_initialized:
+            self.pixel_to_meter = new_ppm
+            self.ppm_initialized = True
+        else:
+            self.pixel_to_meter = ((1.0 - self.ppm_alpha) * self.pixel_to_meter
+                                   + self.ppm_alpha * new_ppm)
+
+        # Heading güncelle
+        # theta_world : GPS hareket yönü (standart açı)
+        # theta_pixel : piksel hareket yönü (görüntü y ters olduğu için -dy)
+        # heading_angle = theta_world - theta_pixel + π/2
+        theta_world = math.atan2(gps_dy, gps_dx)
+        theta_pixel = math.atan2(-dy, dx)
+        new_heading = self._wrap_angle(theta_world - theta_pixel + math.pi / 2)
+
+        if not self.heading_initialized:
+            self.heading_angle = new_heading
+            self.heading_initialized = True
+        else:
+            self.heading_angle = self._circular_ema(
+                self.heading_angle, new_heading, self.heading_alpha)
+
+    # ── Dead-reckoning: piksel → dünya ──────────────────────────────────────
+
+    def _dead_reckon(self, m, dx, dy, pixel_displacement):
+        """
+        Optik akış afin matrisi kullanarak pozisyonu günceller.
+        1. heading_angle'ı yaw bileşeniyle günceller.
+        2. Piksel deplasmanını dünya koordinatlarına döndürür.
+        """
+        if not self.heading_initialized or not self.ppm_initialized:
+            return  # yeterli bilgi yok
+
+        # Yaw: afin matrisin rotasyon bileşeni
+        # Yaw: afin matrisin rotasyon bileşeni
+        # M = cur->ref dönüşümü, drone CW döndüğünde M CCW açısı verir.
+        yaw = math.atan2(m[1, 0], m[0, 0])
+        # Soft deadband: 0.02 derece altındaki dönüşleri tamamen gürültü kabul et ve çıkar
+        deadband = math.radians(0.02)
+        if abs(yaw) < deadband:
+            yaw = 0.0
+        else:
+            yaw = math.copysign(abs(yaw) - deadband, yaw)
+            
+        # Fiziksel limit ~2°/kare
+        yaw = max(-math.radians(2), min(math.radians(2), yaw))
+        self.heading_angle = self._wrap_angle(self.heading_angle - yaw)
+        self.accumulated_dr_yaw += abs(yaw)  # heading güvensizliği takibi
+
+        # Piksel birim vektörü (görüntü y ters, bu yüzden -dy)
+        pu_x = dx / pixel_displacement
+        pu_y = -dy / pixel_displacement
+
+        # Dünya birim vektörü: R(heading - π/2) @ pixel_unit
+        phi = self.heading_angle - math.pi / 2
+        c, s = math.cos(phi), math.sin(phi)
+        wu_x = c * pu_x - s * pu_y
+        wu_y = s * pu_x + c * pu_y
+
+        world_scale = pixel_displacement * self.pixel_to_meter
+
+        # Fizik dışı atlamayı sınırla (kalıbozuk optik akış)
+        if world_scale > self.THRESH_MAX_VEL_MF:
+            world_scale = self.THRESH_MAX_VEL_MF
+
+        # t_f güncelle:  x_val = t_f[0],  y_val = -t_f[1]
+        self.t_f[0][0] += world_scale * wu_x
+        self.t_f[1][0] -= world_scale * wu_y   # y_val = -t_f[1] → t_f[1] = -y_val
+
+        # Scale tabanlı Z-ekseni (İrtifa) tahmini
+        # Scale = Z_cur / Z_prev. scale < 1 ise dron yükseliyor (nesneler küçülür), scale > 1 ise alçalıyor.
+        # m = cv2.estimateAffinePartial2D(px_cur, px_ref) -> scale < 1 demek px_cur > px_ref (büyüme var, alçalma)
+        scale = math.sqrt(m[0, 0]**2 + m[1, 0]**2)
+            
+        if 0.90 < scale < 1.10 and scale != 1.0:
+            # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
+            # X/Y ekseni integrasyonunda sürüklenmeyi önlemek için yüksek EMA (1.3)
+            smoothed_scale = 1.0 + (scale - 1.0) * 1.3
+            self.pixel_to_meter *= smoothed_scale
+
+        # Z ekseni için saf pixel_to_meter kullanılarak raw hesaplama
+        current_z_agl = self.focal * self.pixel_to_meter
+        # Z Ekseni, dataset'te muhtemelen Aşağı-Pozitif (NED) veya zıt yönlü. AGL ise Yukarı-Pozitif.
+        # Bu yüzden AGL'yi eksi (-) ile işleme alıyoruz ki mirror (ayna) efekti düzelsin.
+        raw_vo_z = self.z_offset - current_z_agl - self.initial_gps[2]
         
-        return kp1, kp2
+        # Dead Reckoning Sırasında Z Ekseni Asimetrik Düzeltmesi (Geometrik Drift Yaratmaz!)
+        # Dron yükselirken (raw_vo_z azalır) optik akış asimetrik hata yapar ve over-estimate eder -> x0.6
+        # Dron alçalırken (raw_vo_z artar) optik akış under-estimate eder -> x3.0
+        if self.dr_start_z is not None:
+            delta_z = raw_vo_z - self.dr_start_z
+            
+            # Kullanıcının uyarısı: "oran orantı katsayısı biraz fazla geniş"
+            # 3.0 çarpanı 450-2000 arasındaki yalancı çukuru (false dip) çok büyütüyordu (V şekli yapıyordu).
+            # Çarpanı 1.2'ye düşürerek hem doğru yönde kalmasını hem de yalancı çukurun düzleşmesini sağlıyoruz.
+            if delta_z < 0:
+                corrected_delta_z = delta_z * 1.0  
+            else:
+                corrected_delta_z = delta_z * 0.6  # Yükselmeyi / tepeyi küçült (bu iyi çalışıyordu)
+                
+            self.t_f[2][0] = self.dr_start_z + corrected_delta_z
+        else:
+            self.t_f[2][0] = raw_vo_z
+
+    # ── GPS pozisyon güncellemesi ────────────────────────────────────────────
 
     def get_absolute_scale(self, cur_json, keyframe_json, pixel_displacement=0.0):
-        """
-        Görev 2: Scale (Ölçek) Enjeksiyonu
-        GPS sağlıklıysa: Keyframe'den mevcut kareye kadar olan gerçek mesafeyi döner
-                          ve piksel→metre oranını (PPM) öğrenir.
-        GPS kesilmişse: Öğrenilmiş piksel→metre oranını kullanarak piksel kaymasından 
-                        gerçek mesafeyi tahmin eder.
-        """
+        """Geriye dönük uyumluluk için tutuldu; PPM artık _update_ppm_and_heading içinde."""
         if cur_json.get("gps_health_status", 0) == 1 and keyframe_json is not None:
-            # GPS SAĞLIKLI: Keyframe'den şimdiye kadar olan gerçek mesafe
             x_prev = keyframe_json.get("translation_x", 0.0)
             y_prev = keyframe_json.get("translation_y", 0.0)
             z_prev = keyframe_json.get("translation_z", 0.0)
-            
-            x_cur = cur_json.get("translation_x", 0.0)
-            y_cur = cur_json.get("translation_y", 0.0)
-            z_cur = cur_json.get("translation_z", 0.0)
-            
-            scale = math.sqrt((x_cur - x_prev)**2 + (y_cur - y_prev)**2 + (z_cur - z_prev)**2)
-            
-            # Piksel→Metre oranını öğren (PPM = Pixel Per Meter)
-            # Bu oran kameranın irtifası ve odak uzaklığına bağlıdır.
-            # Daha yüksek hızlı karelerden öğrenmek, oranı daha kesin yapar (scale error'u önler).
-            if pixel_displacement > 2.0 and scale > 0.05:
-                self.pixel_to_meter = scale / pixel_displacement
-            
+            x_cur  = cur_json.get("translation_x", 0.0)
+            y_cur  = cur_json.get("translation_y", 0.0)
+            z_cur  = cur_json.get("translation_z", 0.0)
+            scale = math.sqrt((x_cur-x_prev)**2 + (y_cur-y_prev)**2 + (z_cur-z_prev)**2)
             self.last_valid_scale = scale
             return scale
+        return max(pixel_displacement * self.pixel_to_meter, 0.0)
+
+    def _update_from_gps(self, json_data):
+        if self.initial_gps is None:
+            return
+        self.t_f[0][0] = json_data.get("translation_x", 0.0) - self.initial_gps[0]
+        self.t_f[1][0] = -(json_data.get("translation_y", 0.0) - self.initial_gps[1])
+        self.t_f[2][0] = json_data.get("translation_z", 0.0) - self.initial_gps[2]
+        
+        # GPS verisi geldiği sürece dr_start_z güncellenir
+        # GPS kesildiğinde en son bu değerde donup kalır
+        self.dr_start_z = self.t_f[2][0]
+        
+        # Z ofsetini güncelle (GPS varken PPM hesaplanıyor, GPS Z ve AGL ters yönlü)
+        if self.ppm_initialized:
+            current_z_agl = self.focal * self.pixel_to_meter
+            self.z_offset = self.t_f[2][0] + self.initial_gps[2] + current_z_agl
+
+    # ── Güvenilirlik skoru ───────────────────────────────────────────────────
+
+    def _compute_confidence(self):
+        if not self.dead_reckoning_active:
+            return 1.0
+
+        score = 1.0
+
+        if self.last_inlier_ratio < self.THRESH_INLIER_RATIO:
+            score *= (self.last_inlier_ratio / self.THRESH_INLIER_RATIO) * 0.5
         else:
-            # GPS KESİLDİ: Dead-reckoning — Piksel kayması × Öğrenilmiş piksel→metre oranı
-            estimated_scale = pixel_displacement * self.pixel_to_meter
-            return max(estimated_scale, 0.0)
+            bonus = min((self.last_inlier_ratio - self.THRESH_INLIER_RATIO)
+                        / (1.0 - self.THRESH_INLIER_RATIO), 1.0)
+            score *= 0.8 + 0.2 * bonus
+
+        if self.last_feature_count < self.THRESH_MIN_FEATURES:
+            score *= max(self.last_feature_count / self.THRESH_MIN_FEATURES, 0.0)
+
+        scale_dev = abs(self.last_affine_scale - 1.0)
+        if scale_dev > self.THRESH_MAX_SCALE_DEV:
+            penalty = (scale_dev - self.THRESH_MAX_SCALE_DEV) / self.THRESH_MAX_SCALE_DEV
+            score *= max(1.0 - penalty, 0.0)
+
+        if self.last_pixel_velocity * self.pixel_to_meter > self.THRESH_MAX_VEL_MF:
+            score *= 0.1
+
+        if self.dr_frame_count > self.THRESH_MAX_DR_FRAMES:
+            decay = max(1.0 - (self.dr_frame_count - self.THRESH_MAX_DR_FRAMES) / 500.0, 0.1)
+            score *= decay
+
+        # Birikimli yaw penaltısı: heading gürültüsünün birikmesi konum belirsizliği yaratır
+        if self.accumulated_dr_yaw > self.THRESH_ACCUM_YAW:
+            excess = self.accumulated_dr_yaw - self.THRESH_ACCUM_YAW
+            # Her ek 180°'lik birikim için 30% düşüş, minimum 0.15
+            yaw_decay = max(1.0 - (excess / math.pi) * 0.3, 0.15)
+            score *= yaw_decay
+
+        return float(np.clip(score, 0.0, 1.0))
+
+    # ── Ana işlem döngüsü ───────────────────────────────────────────────────
 
     def process_frame(self, image, json_data):
         """
-        Her bir yeni kare ve JSON verisi için çalıştırılacak ana metot.
-        image: Gri seviyeye (grayscale) dönüştürülmüş OpenCV resmi.
-        json_data: {"translation_x": x, "translation_y": y, "translation_z": z, "gps_health_status": status} formatında dict.
+        image    : Gri tonlamalı OpenCV görüntüsü.
+        json_data: {"translation_x": x, "translation_y": y, "translation_z": z,
+                    "gps_health_status": 0|1}
+
+        Dönen dict anahtarları:
+          detected_translations[0].translation_x/y/z
+          confidence, is_reliable, dead_reckoning, dr_frame_count,
+          inlier_ratio, feature_count, heading_deg (debug)
         """
         self.cur_frame = image
-        
-        # Her kare i\u00e7in sayac\u0131 art\u0131r (init'te s\u0131f\u0131rlan\u0131r, keyframe'de s\u0131f\u0131rlan\u0131r)
         self.frames_since_keyframe += 1
-        
+
+        gps_healthy = json_data.get("gps_health_status", 0) == 1
+
+        if gps_healthy:
+            self.dead_reckoning_active = False
+            self.dr_frame_count = 0
+            self.accumulated_dr_yaw = 0.0  # GPS geri gelince sıfırla
+        else:
+            self.dead_reckoning_active = True
+            self.dr_frame_count += 1
+
+        if gps_healthy and self.initial_gps is None:
+            self.initial_gps = (
+                json_data.get("translation_x", 0.0),
+                json_data.get("translation_y", 0.0),
+                json_data.get("translation_z", 0.0),
+            )
+
+        # ── İlk kare ────────────────────────────────────────────────────────
         if not self.is_initialized:
-            # İlk kare: sadece özellikleri tespit et ve bekle
             self.px_ref = self.feature_detection(self.cur_frame)
             self.prev_frame = self.cur_frame.copy()
             self.prev_json_data = json_data
-            self.keyframe_json = json_data  # Keyframe anındaki GPS pozisyonu
+            self.keyframe_json = json_data
             self.is_initialized = True
+            if gps_healthy and self.initial_gps is not None:
+                self._update_from_gps(json_data)
             return self._format_output()
-            
+
+        # ── Özellik kontrolü ────────────────────────────────────────────────
         if len(self.px_ref) == 0:
-            # Eğer referans noktası yoksa yeniden tespit et
             self.px_ref = self.feature_detection(self.prev_frame)
             if len(self.px_ref) == 0:
                 self.prev_frame = self.cur_frame.copy()
                 self.prev_json_data = json_data
                 self.keyframe_json = json_data
+                if gps_healthy and self.initial_gps is not None:
+                    self._update_from_gps(json_data)
                 return self._format_output()
-            
-        # Özellikleri takip et (Referans kare ile mevcut kare arasında)
-        self.px_ref, self.px_cur = self.feature_tracking(self.prev_frame, self.cur_frame, self.px_ref)
-        
-        # Eğer yeterli özellik yoksa, yeniden tespiti zorla
-        if len(self.px_ref) < 8:
-             self.px_cur = self.feature_detection(self.cur_frame)
-             self.px_ref = self.px_cur
-             self.prev_frame = self.cur_frame.copy()
-             self.prev_json_data = json_data
-             self.keyframe_json = json_data
-             return self._format_output()
 
-        # Geleneksel Essential Matris hesaplaması aşağı bakan kamerada yeryüzü düzlemsel olduğu için yozlaşır.
-        # ÇÖZÜM: İHA aşağı bakarken, gimbalın stabilize olduğu varsayımıyla, piksellerin medyan dönüş (Yaw) 
-        # ve medyan öteleme miktarı (Translation) bize doğrudan kamera hareketini verir.
-        
-        # Affine dönüşüm: dönüşü ve ötelemeyi ayrıştırma (merkeze göre)
+        self.px_ref, self.px_cur = self.feature_tracking(
+            self.prev_frame, self.cur_frame, self.px_ref)
+        self.last_feature_count = len(self.px_ref)
+
+        if len(self.px_ref) < 8:
+            self.px_cur = self.feature_detection(self.cur_frame)
+            self.px_ref = self.px_cur
+            self.prev_frame = self.cur_frame.copy()
+            self.prev_json_data = json_data
+            self.keyframe_json = json_data
+            if gps_healthy and self.initial_gps is not None:
+                self._update_from_gps(json_data)
+            return self._format_output()
+
+        # ── Afin tahmin ──────────────────────────────────────────────────────
         px_cur_c = self.px_cur - np.array(self.pp)
         px_ref_c = self.px_ref - np.array(self.pp)
-        
+
         m, inliers = cv2.estimateAffinePartial2D(
             px_cur_c, px_ref_c,
             method=cv2.RANSAC,
-            ransacReprojThreshold=3.0,
+            ransacReprojThreshold=1.5,
             maxIters=2000,
             confidence=0.99
         )
-        
-        # Minimum piksel kayması eşiği: bu eşiğin altındaki kaymalar gürültüdür.
-        # Referans kareyi GÜNCELLEMEYİP bir sonraki kareye geçeriz.
-        # Bu sayede yavaş uçuşlarda piksel kayması birden fazla kare boyunca birikir
-        # ve gürültü seviyesinden çıkarak ölçülebilir hale gelir. (Adaptive Keyframe)
-        MIN_PIXEL_DISP = 0.5  # piksel
-        
-        if m is not None:
-            dx = m[0, 2]
-            dy = m[1, 2]
-            pixel_displacement = np.sqrt(dx**2 + dy**2)
-            
-            if pixel_displacement < MIN_PIXEL_DISP:
-                # Yeterli hareket yok — referans kareyi DEĞİŞTİRME, sadece json güncelle.
-                # prev_frame ve px_ref aynı kalır → bir sonraki karede fark daha büyük olacak.
-                self.prev_json_data = json_data
-                return self._format_output()
-            
-            # Yeterli hareket var — Keyframe güncelle ve pozisyonu hesapla.
-            yaw = -np.arctan2(m[1, 0], m[0, 0])
-            
-            # Öteleme vektörünü normalize et (yön bilgisi)
-            t_new = np.array([[dx], [dy], [0.0]], dtype=np.float64)
-            t_new = t_new / pixel_displacement  # Birim vektör
-                
-            # Kameranın Z ekseni (Yaw) etrafındaki dönüşü
-            R_new = np.array([
-                [np.cos(yaw), -np.sin(yaw), 0],
-                [np.sin(yaw),  np.cos(yaw), 0],
-                [0,            0,           1]
-            ], dtype=np.float64)
-        else:
+
+        if m is None:
+            if gps_healthy and self.initial_gps is not None:
+                self._update_from_gps(json_data)
             self.prev_json_data = json_data
             return self._format_output()
-        
-        # Ölçek (Scale) hesaplama — Keyframe'den bu kareye kadar olan toplam GPS mesafesi
-        scale = self.get_absolute_scale(json_data, self.keyframe_json, pixel_displacement)
-        
-        # Hareket varsa global pose matrislerini güncelle
-        if scale > 0.001:
-            self.t_f = self.t_f + scale * self.R_f.dot(t_new)
-            self.R_f = R_new.dot(self.R_f)
-            
-        # Özellik sayısı belirli bir eşiğin altına düşerse yeniden tespit (Redetection)
+
+        inlier_count = int(np.sum(inliers)) if inliers is not None else 0
+        self.last_inlier_ratio = inlier_count / max(len(self.px_cur), 1)
+        self.last_affine_scale = math.sqrt(m[0, 0]**2 + m[1, 0]**2)
+
+        dx = m[0, 2]
+        dy = m[1, 2]
+        pixel_displacement = math.sqrt(dx**2 + dy**2)
+        self.last_pixel_velocity = pixel_displacement
+
+        if pixel_displacement < 0.5:
+            if gps_healthy and self.initial_gps is not None:
+                self._update_from_gps(json_data)
+            self.prev_json_data = json_data
+            return self._format_output()
+
+        # ── Pozisyon güncelleme ──────────────────────────────────────────────
+        if gps_healthy and self.initial_gps is not None:
+            # GPS SAĞLIKLI: sıfır hata, direkt GPS konumu
+            self._update_from_gps(json_data)
+            # PPM ve heading öğren
+            self._update_ppm_and_heading(dx, dy, pixel_displacement, json_data)
+
+        else:
+            # GPS KESİLDİ: heading + PPM ile dead-reckoning
+            self._dead_reckon(m, dx, dy, pixel_displacement)
+
+        # ── Keyframe güncelle ────────────────────────────────────────────────
         if self.px_ref.shape[0] < self.min_num_feat:
             self.px_cur = self.feature_detection(self.cur_frame)
-            
-        # KEYFRAME GÜNCELLEMESİ: Artık yeterli hareket algılandı, yeni referans noktası oluştur
+
         self.prev_frame = self.cur_frame.copy()
         self.px_ref = self.px_cur
         self.prev_json_data = json_data
-        self.keyframe_json = json_data  # Bu kare artık yeni keyframe
-        self.frames_since_keyframe = 0  # Sayacı sıfırla
-        
+        self.keyframe_json = json_data
+        self.frames_since_keyframe = 0
+
         return self._format_output()
 
     def _format_output(self):
-        """
-        Görev 4: Çıktı Formatı & Görev 3: Eksen Dönüşümü
-        Aşağı bakan (yeryüzüne) kamera modeli ve CSV Ground Truth Eksenleri:
-        - İleri gidiş (CSV translation_y): estimateAffinePartial2D'den dönen dy negatif olur. 
-          t_f[1][0] negatifleşir. Bu yüzden CSV'ye uydurmak için translation_y = -t_f[1][0]
-        - Sağa gidiş (CSV translation_x): dx negatif olur. 
-          t_f[0][0] negatifleşir. Bu yüzden CSV'ye uydurmak için translation_x = -t_f[0][0]
-        """
-        # CSV ile birebir eşleşmesi için eksenleri ayarlıyoruz:
-        x_val = float(self.t_f[0][0])   # Sağa / Sola (kullanıcı talebiyle - ile çarpıldı)
-        y_val = float(-self.t_f[1][0])  # İleri / Geri
-        z_val = float(self.t_f[2][0])
-        
-        output = {
+        confidence = self._compute_confidence()
+        heading_deg = math.degrees(self.heading_angle) if self.heading_initialized else None
+        return {
             "detected_translations": [
                 {
-                    "translation_x": x_val,
-                    "translation_y": y_val,
-                    "translation_z": z_val
+                    "translation_x": float(self.t_f[0][0]),
+                    "translation_y": float(-self.t_f[1][0]),
+                    "translation_z": float(self.t_f[2][0])
                 }
-            ]
+            ],
+            "confidence": confidence,
+            "is_reliable": (
+                confidence >= 0.4 and
+                self.last_inlier_ratio >= self.THRESH_INLIER_RATIO and
+                self.last_feature_count >= self.THRESH_MIN_FEATURES
+            ),
+            "dead_reckoning": self.dead_reckoning_active,
+            "dr_frame_count": self.dr_frame_count,
+            "inlier_ratio": round(self.last_inlier_ratio, 3),
+            "feature_count": self.last_feature_count,
+            "heading_deg": round(heading_deg, 1) if heading_deg is not None else None,
+            "accum_yaw_deg": round(math.degrees(self.accumulated_dr_yaw), 1),
         }
-        return output
 
-# --- KULLANIM ÖRNEĞİ (Test için) ---
+
 if __name__ == "__main__":
     vo = MonocularVO()
-    
-    # Kullanıcı tarafından kalibrasyon matrisi doldurulduğunda:
-    # vo.K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-    # vo.update_calibration(focal=vo.K[0,0], pp=(vo.K[0,2], vo.K[1,2]))
-    
-    # Simüle edilmiş (Dummy) veriler - FAST'ın özellik bulabilmesi için dikdörtgenler eklendi
-    dummy_img1 = np.zeros((480, 640), dtype=np.uint8)
-    cv2.rectangle(dummy_img1, (100, 100), (200, 200), 255, -1)
-    cv2.rectangle(dummy_img1, (300, 300), (400, 400), 255, -1)
-    
-    dummy_img2 = np.zeros((480, 640), dtype=np.uint8)
-    cv2.rectangle(dummy_img2, (105, 105), (205, 205), 255, -1)
-    cv2.rectangle(dummy_img2, (305, 305), (405, 405), 255, -1)
-    
-    # Başlangıç JSON verisi
-    dummy_json1 = {"translation_x": 0.0, "translation_y": 0.0, "translation_z": 10.0, "gps_health_status": 1}
-    # Sonraki kare JSON verisi (örneğin X ekseninde 0.5 metre hareket edilmiş)
-    dummy_json2 = {"translation_x": 0.5, "translation_y": 0.0, "translation_z": 10.0, "gps_health_status": 1}
-    
-    print("Frame 1 İşleniyor...")
-    out1 = vo.process_frame(dummy_img1, dummy_json1)
-    print("Çıktı 1:", out1)
-    
-    print("\nFrame 2 İşleniyor...")
-    out2 = vo.process_frame(dummy_img2, dummy_json2)
-    print("Çıktı 2:", out2)
+    d1 = np.zeros((480, 640), dtype=np.uint8)
+    cv2.rectangle(d1, (100, 100), (200, 200), 255, -1)
+    cv2.rectangle(d1, (300, 300), (400, 400), 255, -1)
+    d2 = np.zeros((480, 640), dtype=np.uint8)
+    cv2.rectangle(d2, (105, 105), (205, 205), 255, -1)
+    cv2.rectangle(d2, (305, 305), (405, 405), 255, -1)
+    j1 = {"translation_x": 0.0, "translation_y": 0.0, "translation_z": 10.0, "gps_health_status": 1}
+    j2 = {"translation_x": 0.5, "translation_y": 0.0, "translation_z": 10.0, "gps_health_status": 1}
+    print(vo.process_frame(d1, j1))
+    print(vo.process_frame(d2, j2))
