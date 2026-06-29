@@ -38,6 +38,10 @@ Bu sistem, dronun GPS sinyali alamadığı durumlarda üzerindeki monoküler (te
 **Problem:** GPS kesildiğinde koordinatların ve irtifanın (Z) aniden sıçraması.
 **Çözüm:** GPS'in sağlıklı olduğu son ana kadarki `translation_x, y, z` verileri `initial_gps` ve `dr_start_z` gibi offset (ofset) değişkenleriyle tutuldu. Kesinti yaşandığı an (örneğin 450. kare), pozisyon bu kilitli offsetler üzerinden üstüne eklenerek ilerletildi (Seamless transition).
 
+### E. 3 Boyutlu Yörünge ve Animasyon Geliştirmesi
+**Problem:** Z ekseni ve 2D yörünge grafiklerinin ayrı ayrı incelenmesi, gerçek rotanın (GT) ve tahminin (VO) bütüncül davranışını kavramayı zorlaştırıyordu.
+**Çözüm:** `fast_test.py` içerisine matplotlib ile 3D yörünge grafiği (X, Y, Z uzayı) entegre edildi. Ayrıca, bu rotayı zaman içinde hareket eden iki obje olarak görselleştiren `animate_3d.py` scripti eklendi. Sistem, tahmin edilen verileri `trajectory_data.csv` olarak dışa aktararak animasyonun MP4 (30 FPS) olarak render edilmesini sağladı.
+
 ## 4. Gelecek Adımlar
 - **Dönüş Asimetrisi:** Hızlı dönüşlerdeki (yaw) piksel kaymalarının doğrusal harekete karışmasını önlemek için jiroskop (IMU) destekli veya daha sofistike Feature Rejection metotları incelenebilir.
 - **PPM Kalibrasyonu:** Hızın sıfıra yaklaştığı anlarda (durma/hover) PPM öğrenme katsayısının askıya alınması (ağırlığının düşürülmesi).
