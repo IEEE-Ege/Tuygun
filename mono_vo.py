@@ -123,6 +123,17 @@ class MonocularVO:
         mask = np.zeros_like(img)
         mask[margin_y:h-margin_y, margin_x:w-margin_x] = 255
         
+        if self.sensor_type == "THERMAL":
+            # Termal kameralarda ortadaki sabit crosshair'i (hedef imlecini) maskele
+            cy, cx = h // 2, w // 2
+            mask[cy-40:cy+40, cx-40:cx+40] = 0
+            
+            # Termal için gürültüye daha dayanıklı Shi-Tomasi kullan
+            corners = cv2.goodFeaturesToTrack(img, maxCorners=3000, qualityLevel=0.01, minDistance=5, mask=mask)
+            if corners is not None:
+                return corners.reshape(-1, 2)
+            return np.empty((0, 2), dtype=np.float32)
+
         keypoints = self.detector.detect(img, mask=mask)
         if not keypoints:
             return np.empty((0, 2), dtype=np.float32)
@@ -266,8 +277,8 @@ class MonocularVO:
             
         if 0.90 < scale < 1.30 and scale != 1.0:
             # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
-            # X/Y ekseni integrasyonunda sürüklenmeyi önlemek için düşük EMA (0.7)
-            smoothed_scale = 1.0 + (scale - 1.0) * 1.3
+            alpha_scale = 0.05 if self.sensor_type == "THERMAL" else 1.3
+            smoothed_scale = 1.0 + (scale - 1.0) * alpha_scale
             self.ppm_x *= smoothed_scale
             self.ppm_y *= smoothed_scale
 
