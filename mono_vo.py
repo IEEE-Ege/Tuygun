@@ -189,13 +189,14 @@ class MonocularVO:
 
         ppm_general = gps_dist / pixel_displacement
 
-        # Drone genellikle ileri uçtuğu için (kamera Y ekseni), genel PPM Y eksenini iyi temsil eder.
-        # Ancak kamera aşağı eğik (pitch) veya FOV farklıysa, X ekseninde 1 pikselin temsil ettiği 
-        # dünya mesafesi Y'den daha fazladır. X eksenindeki "overshoot" sapmalarını gidermek için 
-        # X PPM'ini sabit bir katsayı ile büyütüyoruz.
-        PPM_X_MULTIPLIER = 1.0  # X eksenindeki "overshoot" için ampirik katsayı
+        if self.sensor_type == "THERMAL":
+            PPM_X_MULTIPLIER = 0.85
+            PPM_Y_MULTIPLIER = 0.85
+        else:
+            PPM_X_MULTIPLIER = 1.0
+            PPM_Y_MULTIPLIER = 1.0
 
-        new_ppm_y = ppm_general
+        new_ppm_y = ppm_general * PPM_Y_MULTIPLIER
         new_ppm_x = ppm_general * PPM_X_MULTIPLIER
 
         # PPM güncelle
@@ -277,7 +278,7 @@ class MonocularVO:
             
         if 0.90 < scale < 1.30 and scale != 1.0:
             # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
-            alpha_scale = 0.05 if self.sensor_type == "THERMAL" else 1.3
+            alpha_scale = 0.0 if self.sensor_type == "THERMAL" else 1.3
             smoothed_scale = 1.0 + (scale - 1.0) * alpha_scale
             self.ppm_x *= smoothed_scale
             self.ppm_y *= smoothed_scale
