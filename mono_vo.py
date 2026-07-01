@@ -211,10 +211,10 @@ class MonocularVO:
 
         # Heading güncelle
         # theta_world : GPS hareket yönü (standart açı)
-        # theta_pixel : piksel hareket yönü (görüntü y ters olduğu için -dy)
+        # theta_pixel : metrik olarak ölçeklenmiş piksel hareket yönü
         # heading_angle = theta_world - theta_pixel + π/2
         theta_world = math.atan2(gps_dy, gps_dx)
-        theta_pixel = math.atan2(-dy, dx)
+        theta_pixel = math.atan2(-dy * new_ppm_y, dx * new_ppm_x)
         new_heading = self._wrap_angle(theta_world - theta_pixel + math.pi / 2)
 
         if not self.heading_initialized:
@@ -279,7 +279,13 @@ class MonocularVO:
             
         if 0.90 < scale < 1.30 and scale != 1.0:
             # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
-            alpha_scale = 0.0 if self.sensor_type == "THERMAL" else 1.3
+            if self.sensor_type == "THERMAL":
+                if 0.95 < scale < 1.05:
+                    alpha_scale = 0.02
+                else:
+                    alpha_scale = 0.0
+            else:
+                alpha_scale = 1.3
             smoothed_scale = 1.0 + (scale - 1.0) * alpha_scale
             self.ppm_x *= smoothed_scale
             self.ppm_y *= smoothed_scale
