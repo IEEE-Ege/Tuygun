@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import math
@@ -190,8 +191,8 @@ class MonocularVO:
         ppm_general = gps_dist / pixel_displacement
 
         if self.sensor_type == "THERMAL":
-            PPM_X_MULTIPLIER = 0.85
-            PPM_Y_MULTIPLIER = 0.85
+            PPM_X_MULTIPLIER = float(os.environ.get("PPM_X", 0.60))
+            PPM_Y_MULTIPLIER = float(os.environ.get("PPM_Y", 0.60))
         else:
             PPM_X_MULTIPLIER = 1.0
             PPM_Y_MULTIPLIER = 1.0
