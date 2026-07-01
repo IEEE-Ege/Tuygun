@@ -327,7 +327,7 @@ def main():
         colors_norm = np.array(conf_list[:-1])
         lc = LineCollection(segs, cmap="RdYlGn", norm=plt.Normalize(0, 1))
         lc.set_array(colors_norm)
-        lc.set_linewidth(2)
+        lc.set_linewidth(1)
         ax.add_collection(lc)
         fig.colorbar(lc, ax=ax, label="Confidence (0=kötü, 1=iyi)")
 
@@ -348,7 +348,7 @@ def main():
     margin = 30
     ax.set_xlim([np.min(all_x)-margin, np.max(all_x)+margin])
     ax.set_ylim([np.min(all_y)-margin, np.max(all_y)+margin])
-    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_aspect('equal', adjustable='box')
     
     if has_gps_reference:
         metrics_text = (
