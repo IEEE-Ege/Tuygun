@@ -4,8 +4,9 @@ import math
 
 
 class MonocularVO:
-    def __init__(self, min_num_feat=2000):
+    def __init__(self, min_num_feat=2000, sensor_type="RGB"):
         self.min_num_feat = min_num_feat
+        self.sensor_type = sensor_type
 
         self.K = np.array([
             [0.0, 0.0, 0.0],
@@ -89,8 +90,12 @@ class MonocularVO:
         self.keyframe_json = None
         self.is_initialized = False
 
+        # Termal görüntüler için kontrast artırıcı CLAHE objesi
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)) if self.sensor_type == "THERMAL" else None
+
         # ── Detektör ve Parametreler ─────────────────────────────────────────────
-        self.detector = cv2.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
+        fast_threshold = 10 if self.sensor_type == "THERMAL" else 20
+        self.detector = cv2.FastFeatureDetector_create(threshold=fast_threshold, nonmaxSuppression=True)
         self.lk_params = dict(winSize=(21, 21),
                               maxLevel=5,
                               criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -379,7 +384,11 @@ class MonocularVO:
           confidence, is_reliable, dead_reckoning, dr_frame_count,
           inlier_ratio, feature_count, heading_deg (debug)
         """
-        self.cur_frame = image
+        if self.clahe is not None:
+            self.cur_frame = self.clahe.apply(image)
+        else:
+            self.cur_frame = image
+            
         self.frames_since_keyframe += 1
 
         gps_healthy = json_data.get("gps_health_status", 0) == 1

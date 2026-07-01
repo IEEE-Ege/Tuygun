@@ -33,18 +33,30 @@ import math
 # OUT_FIG             = "trajectory_comparison_2024_v5.png"
 # GPS_KESILME_KARESI  = 300
 #
-# SEÇENEK E: 2026 Video 1 (GPS verisi mevcut)
-DATA_DIR            = "2026/THYZ_2026_Ornek_Veri_1.MP4"
-CSV_PATH            = "2026/THYZ_2026_Ornek_Veri_1_translation.csv"
-OUT_FIG             = "trajectory_comparison_2026_v1.png"
-GPS_KESILME_KARESI  = 450
-#
-PROCESS_SCALE       = 0.5
-# 2026 kamera kalibrasyonu (1920×1080 için, PROCESS_SCALE ile ölçekle):
-FX = 1389.7 * PROCESS_SCALE
-FY = 1387.1 * PROCESS_SCALE
-CX = 954.007 * PROCESS_SCALE
-CY = 558.896 * PROCESS_SCALE
+SENSOR_TYPE = "THERMAL"  # "RGB" veya "THERMAL"
+
+if SENSOR_TYPE == "THERMAL":
+    DATA_DIR            = "2026_Thermal/THYZ_2026_Ornek_Veri_2_Termal.MP4"
+    CSV_PATH            = "2026_Thermal/THYZ_2026_Ornek_Veri_2_Termal_translation.csv"
+    OUT_FIG             = "trajectory_comparison_2026_thermal.png"
+    GPS_KESILME_KARESI  = 450
+    PROCESS_SCALE       = 1.0  # Termal görüntü 512x640, küçültmeye gerek yok
+    FX = 731.7965 * PROCESS_SCALE
+    FY = 732.0172 * PROCESS_SCALE
+    CX = 319.2367 * PROCESS_SCALE
+    CY = 251.2424 * PROCESS_SCALE
+else:
+    # SEÇENEK E: 2026 Video 1 RGB (GPS verisi mevcut)
+    DATA_DIR            = "2026/THYZ_2026_Ornek_Veri_1.MP4"
+    CSV_PATH            = "2026/THYZ_2026_Ornek_Veri_1_translation.csv"
+    OUT_FIG             = "trajectory_comparison_2026_v1.png"
+    GPS_KESILME_KARESI  = 450
+    PROCESS_SCALE       = 0.5
+    # 2026 kamera kalibrasyonu (1920×1080 için, PROCESS_SCALE ile ölçekle):
+    FX = 1389.7 * PROCESS_SCALE
+    FY = 1387.1 * PROCESS_SCALE
+    CX = 954.007 * PROCESS_SCALE
+    CY = 558.896 * PROCESS_SCALE
 # ─────────────────────────────────────────────────────────────────────────────
 
 # GPS verisi olmadığında kullanılacak varsayılan değerler
@@ -111,7 +123,7 @@ def main():
     print("Hızlı test başlatılıyor...")
 
     K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
-    vo = MonocularVO()
+    vo = MonocularVO(sensor_type=SENSOR_TYPE)
     vo.K = K
     vo.update_calibration(focal=FX, pp=(CX, CY))
     print(f"Kalibrasyon — fx={FX:.1f}  fy={FY:.1f}  cx={CX:.1f}  cy={CY:.1f}")
