@@ -1,13 +1,19 @@
-import os
 import cv2
 import numpy as np
 import math
+
+try:
+    from vo.vo_params import get_params   # kökten çalıştırılınca (main.py)
+except ImportError:
+    from vo_params import get_params      # vo/ içinden doğrudan çalıştırılınca
 
 
 class MonocularVO:
     def __init__(self, min_num_feat=2000, sensor_type="RGB"):
         self.min_num_feat = min_num_feat
         self.sensor_type = sensor_type
+        # Elle ayarlanabilir tüm parametreler vo_params.py'de toplanmıştır
+        self.P = get_params(sensor_type)
 
         self.K = np.array([
             [0.0, 0.0, 0.0],
@@ -36,6 +42,18 @@ class MonocularVO:
         self.ppm_y = 0.10
         self.ppm_initialized = False
         self.ppm_alpha = 0.15
+        # GPS fazında PPM/heading öğrenimine kanıt sağlayan toplam GPS yolu (m).
+        # Bu eşiğin altında kalırsa (örn. GPS fazında hover) ölçek ÖĞRENİLMEMİŞ
+        # demektir; dead-reckoning varsayılan PPM ile yapılır ve confidence düşer.
+        self.gps_motion_total = 0.0
+        self.SCALE_LEARN_MIN_DIST = 5.0
+        # Yavaş/yüksek irtifalı uçuşlarda kare başına akış öğrenme eşiğinin
+        # altında kalır (2024: ~1.5 px/kare < 3 px eşik → hiç öğrenme olmuyordu).
+        # Piksel deltaları eşik aşılana kadar kareler boyunca BİRİKTİRİLİR.
+        self._acc_dx = 0.0
+        self._acc_dy = 0.0
+        self._acc_frames = 0
+        self._acc_start_gps = None
 
         # ── Heading (yön) takibi ─────────────────────────────────────────────
         #
@@ -56,11 +74,30 @@ class MonocularVO:
         #   pixel_unit = [dx/|d|,  -dy/|d|]   ← görüntü y ekseni ters
         #   world_unit = R(phi) @ pixel_unit
         #   world_delta = PPM * |d| * world_unit
+        # ── Chirality (yansıma) tespiti ──────────────────────────────────────
+        # Bazı yıllarda (2024 verisi) kamera/CSV eksen konvansiyonu aynalı:
+        # piksel→dünya dönüşümü rotasyon değil YANSIMA gerektirir. GPS fazında
+        # iki hipotez paralel izlenir; heading'i iç tutarlı olan seçilir.
+        #   chirality = +1 → normal (dy işareti ters, mevcut konvansiyon)
+        #   chirality = -1 → aynalı (dy işareti düz, yaw yönü de ters)
+        self.chirality = 1.0
+        self._chir_h = {1: None, -1: None}     # hipotez başına heading EMA
+        self._chir_err = {1: None, -1: None}   # hipotez başına |yenilik| EMA
+        self._chir_n = 0
+
         self.heading_angle = None
         self.heading_initialized = False
-        self.heading_alpha = 0.15         # EMA ağırlığı (GPS güncellemesi)
-        self.heading_gps_min_dist = 0.05  # GPS deltası bu m'nin altındaysa atla
-        self.heading_pix_min_disp = 3.0   # piksel delta bu px'in altındaysa atla
+        self.heading_alpha = self.P["heading_alpha"]  # EMA ağırlığı (GPS güncellemesi)
+        # Birikimli örnek eşikleri: güncelleme ancak İKİSİ de sağlanınca yapılır.
+        # GPS eşiği 0.5 m — hover jitter'ı (mm/kare) PPM'i zehirlemesin (SNR).
+        # 0.2 m: hover jitter'ı eler (100 karelik pencerede ~0.17 m < eşik)
+        # ama normal uçuşta sık güncellemeye izin verir. 0.5 çok seyrekleştirip
+        # 2025 RGB V1 kazancını kaybettiriyordu, 0.05 hover çöpü topluyordu.
+        self.heading_gps_min_dist = 0.2   # birikmiş GPS deltası (m)
+        self.heading_pix_min_disp = 3.0   # birikmiş piksel deltası (px)
+        self.ACC_MAX_FRAMES = 100  # pencere yaş sınırı: eşiklere bu sürede
+                                   # ulaşılamazsa (hover) segment atılır; uzun
+                                   # pencerede dönme birikimi düz toplamayı bozar
 
         # ── Güvenilirlik takibi ──────────────────────────────────────────────
         self.dead_reckoning_active = False
@@ -92,14 +129,18 @@ class MonocularVO:
         self.is_initialized = False
 
         # Termal görüntüler için kontrast artırıcı CLAHE objesi
-        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)) if self.sensor_type == "THERMAL" else None
+        clip = self.P["clahe_clip_limit"]
+        self.clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)) if clip is not None else None
 
         # ── Detektör ve Parametreler ─────────────────────────────────────────────
-        fast_threshold = 10 if self.sensor_type == "THERMAL" else 20
-        self.detector = cv2.FastFeatureDetector_create(threshold=fast_threshold, nonmaxSuppression=True)
-        self.lk_params = dict(winSize=(21, 21),
+        self.detector = cv2.FastFeatureDetector_create(
+            threshold=self.P.get("fast_threshold", 10), nonmaxSuppression=True)
+
+        win = self.P["lk_win_size"]
+        self.lk_params = dict(winSize=(win, win),
                               maxLevel=5,
-                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                                        self.P["lk_max_iters"], self.P["lk_epsilon"]))
 
     def update_calibration(self, focal, pp):
         self.focal = focal
@@ -124,13 +165,17 @@ class MonocularVO:
         mask = np.zeros_like(img)
         mask[margin_y:h-margin_y, margin_x:w-margin_x] = 255
         
-        if self.sensor_type == "THERMAL":
+        if self.sensor_type.startswith("THERMAL"):
             # Termal kameralarda ortadaki sabit crosshair'i (hedef imlecini) maskele
             cy, cx = h // 2, w // 2
             mask[cy-40:cy+40, cx-40:cx+40] = 0
             
-            # Termal için gürültüye daha dayanıklı Shi-Tomasi kullan
-            corners = cv2.goodFeaturesToTrack(img, maxCorners=3000, qualityLevel=0.01, minDistance=5, mask=mask)
+            # Termal için gürültüye daha dayanıklı Shi-Tomasi kullan (daha az ama çok güçlü noktalar)
+            corners = cv2.goodFeaturesToTrack(img,
+                                              maxCorners=self.P["shi_max_corners"],
+                                              qualityLevel=self.P["shi_quality_level"],
+                                              minDistance=self.P["shi_min_distance"],
+                                              mask=mask)
             if corners is not None:
                 return corners.reshape(-1, 2)
             return np.empty((0, 2), dtype=np.float32)
@@ -138,7 +183,8 @@ class MonocularVO:
         keypoints = self.detector.detect(img, mask=mask)
         if not keypoints:
             return np.empty((0, 2), dtype=np.float32)
-        keypoints = sorted(keypoints, key=lambda kp: kp.response, reverse=True)[:3000]
+        keypoints = sorted(keypoints, key=lambda kp: kp.response,
+                           reverse=True)[:self.P.get("fast_max_keypoints", 3000)]
         return np.array([kp.pt for kp in keypoints], dtype=np.float32)
 
     def feature_tracking(self, img_ref, img_cur, px_ref):
@@ -165,40 +211,49 @@ class MonocularVO:
         GPS sağlıklıyken her keyframe geçişinde çağrılır.
         PPM ve heading_angle'ı GPS + optik akış bilgisiyle günceller.
         """
-        if (self.keyframe_json is None
-                or pixel_displacement < self.heading_pix_min_disp):
+        if self.keyframe_json is None:
             return
 
-        kf_x = self.keyframe_json.get("translation_x", 0.0)
-        kf_y = self.keyframe_json.get("translation_y", 0.0)
-        gps_dx = json_data.get("translation_x", 0.0) - kf_x
-        gps_dy = json_data.get("translation_y", 0.0) - kf_y
+        # ── Piksel delta birikimi ────────────────────────────────────────────
+        # Kare başına akış eşik altında kalabilir (yavaş uçuş); eşik aşılana
+        # kadar biriktir, sinyal yeterince toplanınca TEK güncelleme yap.
+        # (Kare-arası rotasyon <2° kelepçeli olduğundan düz toplama geçerlidir.)
+        if self._acc_start_gps is None:
+            self._acc_start_gps = (self.keyframe_json.get("translation_x", 0.0),
+                                   self.keyframe_json.get("translation_y", 0.0))
+            self._acc_frames = 0
+        self._acc_dx += dx
+        self._acc_dy += dy
+        self._acc_frames += 1
+        acc_disp = math.hypot(self._acc_dx, self._acc_dy)
+
+        gps_dx = json_data.get("translation_x", 0.0) - self._acc_start_gps[0]
+        gps_dy = json_data.get("translation_y", 0.0) - self._acc_start_gps[1]
         gps_dist = math.sqrt(gps_dx**2 + gps_dy**2)
 
-        if gps_dist < self.heading_gps_min_dist:
+        if acc_disp < self.heading_pix_min_disp or gps_dist < self.heading_gps_min_dist:
+            # Henüz yeterli sinyal yok — biriktirmeye devam; ama pencere çok
+            # yaşlandıysa (hover / dönüş birikimi) segmenti at
+            if self._acc_frames >= self.ACC_MAX_FRAMES:
+                self._acc_dx = self._acc_dy = 0.0
+                self._acc_start_gps = None
             return
 
-        # Dünya üzerindeki gps hareketini kamera frame'ine geri döndür
-        phi = self.heading_angle - math.pi / 2
-        c, s = math.cos(phi), math.sin(phi)
-        
-        cx_meter = c * gps_dx + s * gps_dy
-        cy_meter = -s * gps_dx + c * gps_dy
-        
-        cx_pixel = dx
-        cy_pixel = -dy
+        # Bu güncellemede birikmiş deltalar kullanılır, sonra birikim sıfırlanır
+        dx = self._acc_dx
+        dy = self._acc_dy
+        pixel_displacement = acc_disp
+        self._acc_dx = self._acc_dy = 0.0
+        self._acc_frames = 0
+        self._acc_start_gps = (json_data.get("translation_x", 0.0),
+                               json_data.get("translation_y", 0.0))
+
+        self.gps_motion_total += gps_dist
 
         ppm_general = gps_dist / pixel_displacement
 
-        if self.sensor_type == "THERMAL":
-            PPM_X_MULTIPLIER = float(os.environ.get("PPM_X", 0.60))
-            PPM_Y_MULTIPLIER = float(os.environ.get("PPM_Y", 0.60))
-        else:
-            PPM_X_MULTIPLIER = 1.0
-            PPM_Y_MULTIPLIER = 1.0
-
-        new_ppm_y = ppm_general * PPM_Y_MULTIPLIER
-        new_ppm_x = ppm_general * PPM_X_MULTIPLIER
+        new_ppm_y = ppm_general * self.P["ppm_multiplier_y"]
+        new_ppm_x = ppm_general * self.P["ppm_multiplier_x"]
 
         # PPM güncelle
         if not self.ppm_initialized:
@@ -214,7 +269,34 @@ class MonocularVO:
         # theta_pixel : metrik olarak ölçeklenmiş piksel hareket yönü
         # heading_angle = theta_world - theta_pixel + π/2
         theta_world = math.atan2(gps_dy, gps_dx)
-        theta_pixel = math.atan2(-dy * new_ppm_y, dx * new_ppm_x)
+
+        # ── Chirality hipotez takibi ─────────────────────────────────────────
+        # Doğru hipotezde heading tahmini gidiş yönünden bağımsız tutarlıdır;
+        # yanlış hipotezde her dönüşte zıplar (yenilik hatası büyür).
+        for s in (1, -1):
+            tp = math.atan2(-s * dy * new_ppm_y, dx * new_ppm_x)
+            h = self._wrap_angle(theta_world - tp + math.pi / 2)
+            onceki = self._chir_h[s]
+            if onceki is None:
+                self._chir_h[s] = h
+            else:
+                yenilik = abs(self._wrap_angle(h - onceki))
+                e = self._chir_err[s]
+                self._chir_err[s] = yenilik if e is None else 0.9 * e + 0.1 * yenilik
+                self._chir_h[s] = self._circular_ema(onceki, h, 0.5)
+        self._chir_n += 1
+        if (self._chir_n >= 20
+                and self._chir_err[1] is not None and self._chir_err[-1] is not None):
+            aktif = int(self.chirality)
+            diger = -aktif
+            # Histerezis: ancak diğer hipotez belirgin (2x) tutarlıysa geç
+            if self._chir_err[diger] < 0.5 * self._chir_err[aktif]:
+                print(f"  [VO] YANSIMA TESPİTİ: chirality {aktif:+d} → {diger:+d} "
+                      f"(yenilik hatası {self._chir_err[aktif]:.3f} → {self._chir_err[diger]:.3f} rad)")
+                self.chirality = float(diger)
+                self.heading_angle = self._chir_h[diger]
+
+        theta_pixel = math.atan2(-self.chirality * dy * new_ppm_y, dx * new_ppm_x)
         new_heading = self._wrap_angle(theta_world - theta_pixel + math.pi / 2)
 
         if not self.heading_initialized:
@@ -238,21 +320,57 @@ class MonocularVO:
         # Yaw: afin matrisin rotasyon bileşeni
         # M = cur->ref dönüşümü, drone CW döndüğünde M CCW açısı verir.
         yaw = math.atan2(m[1, 0], m[0, 0])
-        # Soft deadband: 0.02 derece altındaki dönüşleri tamamen gürültü (sistematik hata) kabul et
-        deadband = math.radians(0.02)
+        # Soft deadband: eşik altındaki dönüşleri gürültü kabul et
+        deadband = math.radians(self.P["yaw_deadband_deg"])
         if abs(yaw) < deadband:
             yaw = 0.0
-        else:
-            yaw = math.copysign(abs(yaw) - deadband, yaw)
-            
-        # Fiziksel limit ~2°/kare
-        yaw = max(-math.radians(2), min(math.radians(2), yaw))
-        self.heading_angle = self._wrap_angle(self.heading_angle - yaw)
+
+        # Fiziksel yaw limiti (°/kare)
+        clamp = math.radians(self.P["yaw_clamp_deg"])
+        yaw = max(-clamp, min(clamp, yaw))
+        # Aynalı geometride görüntüden ölçülen yaw'un dünya yönü de terstir
+        self.heading_angle = self._wrap_angle(self.heading_angle - self.chirality * yaw)
         self.accumulated_dr_yaw += abs(yaw)  # heading güvensizliği takibi
 
-        # Kamera frame'indeki metrik hareket:
-        dx_meter = dx * self.ppm_x
-        dy_meter = -dy * self.ppm_y
+        # Güncel AGL irtifamızı hesaplayalım (düzeltilmiş Z ekseninden)
+        # GPS hiç görülmediyse (salt optik akış modu) başlangıç Z'si 0 kabul edilir
+        init_z = self.initial_gps[2] if self.initial_gps is not None else 0.0
+        current_z_agl = max(self.z_offset - self.t_f[2][0] - init_z, 1.0)
+        # Optik akıştan gelen ham AGL irtifası
+        raw_z_agl = max(self.focal * ((self.ppm_x + self.ppm_y) / 2.0), 1.0)
+
+        # Düzeltilmiş irtifaya göre PPM çarpanı (irtifa arttıkça PPM de artmalı)
+        # Kelepçe: Z ekseni sürüklenirse current_z_agl 1 m tabanına çakılıp
+        # çarpanı ~0 yapıyor ve XY tahmini tamamen donuyordu (2025 testi).
+        # İrtifa kompanzasyonu en fazla ±2x düzeltme yapabilir.
+        z_multiplier = min(max(current_z_agl / raw_z_agl, 0.5), 2.0)
+
+        # Kamera frame'indeki metrik hareket (irtifa düzeltmeli):
+        dx_meter = dx * (self.ppm_x * z_multiplier)
+        dy_meter = -self.chirality * dy * (self.ppm_y * z_multiplier)
+
+        if self.sensor_type.startswith("THERMAL"):
+            # Eksen kazançları: DR ilerledikçe (dr_progress 0→1) doğrusal değişir
+            # (THERMAL_2025 profilinde katsayılar nötr — blok etkisiz)
+            dr_progress = min(self.dr_frame_count / self.P["dr_progress_frames"], 1.0)
+            dy_correction = self.P["dy_base"] - self.P["dy_slope"] * dr_progress
+            dy_meter *= dy_correction
+            dx_correction = 1.0 + self.P["dx_slope"] * dr_progress
+            dx_meter *= dx_correction
+
+            # ── Dönüş-farkında XY sönümleme ──────────────────────────────────
+            # Hızlı yaw dönüşlerinde (kamera tam nadir olmadığından) dönüş,
+            # öteleme benzeri sahte akış üretir; VO gerçekte olmayan XY hareketi
+            # ölçer (analiz: dönüş pencerelerinde 1.5-4.6x aşırı ölçüm, düz
+            # uçuşta oran ~1.0). Ham |yaw|'ın EMA'sı dönüş dedektörüdür; eşik
+            # normal uçuş seviyesinin üstünde olduğundan düz uçuş hiç etkilenmez,
+            # sadece belirgin dönüşlerde sönümleme devreye girer.
+            raw_yaw_deg = abs(math.degrees(math.atan2(m[1, 0], m[0, 0])))
+            self.turn_ema = 0.95 * getattr(self, "turn_ema", 0.0) + 0.05 * raw_yaw_deg
+            turn_excess = max(self.turn_ema - self.P["turn_thresh"], 0.0)
+            maneuver_damp = 1.0 / (1.0 + self.P["turn_gain"] * turn_excess)
+            dx_meter *= maneuver_damp
+            dy_meter *= maneuver_damp
 
         # Dünya birim vektörü hesabını kamera metre hesabıyla yapalım:
         phi = self.heading_angle - math.pi / 2
@@ -262,9 +380,11 @@ class MonocularVO:
         world_dy = s * dx_meter + c * dy_meter
 
         # Fizik dışı atlamayı sınırla (kalıbozuk optik akış)
+        # DR ilerledikçe giderek daha sıkı sınırlandır (drift birikmesini yavaşlat)
+        dr_velocity_cap = max(self.THRESH_MAX_VEL_MF - (self.dr_frame_count / 3000.0) * 2.0, 2.5)
         dist = math.sqrt(world_dx**2 + world_dy**2)
-        if dist > self.THRESH_MAX_VEL_MF:
-            ratio = self.THRESH_MAX_VEL_MF / dist
+        if dist > dr_velocity_cap:
+            ratio = dr_velocity_cap / dist
             world_dx *= ratio
             world_dy *= ratio
 
@@ -276,17 +396,19 @@ class MonocularVO:
         # Scale = Z_cur / Z_prev. scale < 1 ise dron yükseliyor (nesneler küçülür), scale > 1 ise alçalıyor.
         # m = cv2.estimateAffinePartial2D(px_cur, px_ref) -> scale < 1 demek px_cur > px_ref (büyüme var, alçalma)
         scale = math.sqrt(m[0, 0]**2 + m[1, 0]**2)
-            
+
         if 0.90 < scale < 1.30 and scale != 1.0:
             # Gürültü ve ani sıçramaları önlemek için Exponential Moving Average (EMA)
-            if self.sensor_type == "THERMAL":
-                if 0.95 < scale < 1.05:
-                    alpha_scale = 0.02
-                else:
-                    alpha_scale = 0.0
+            # Bant kontrolü artık her sensörde: banttan uzak scale değerleri gürültü/
+            # manevra kaynaklıdır, PPM'e işlenirse binlerce karede tek yönlü aşınma
+            # yapıp Z'yi sürüklüyordu (2025 testindeki donmanın kök nedeni).
+            if 0.95 < scale < 1.05:
+                alpha_scale = self.P["alpha_scale"]
             else:
-                alpha_scale = 1.3
+                alpha_scale = 0.0
             smoothed_scale = 1.0 + (scale - 1.0) * alpha_scale
+            # PPM değişimini kare başına ±2% ile sınırla (drift kartopu etkisini daha iyi engelle)
+            smoothed_scale = max(0.98, min(1.02, smoothed_scale))
             self.ppm_x *= smoothed_scale
             self.ppm_y *= smoothed_scale
 
@@ -294,7 +416,7 @@ class MonocularVO:
         current_z_agl = self.focal * ((self.ppm_x + self.ppm_y) / 2.0)
         # Z Ekseni, dataset'te muhtemelen Aşağı-Pozitif (NED) veya zıt yönlü. AGL ise Yukarı-Pozitif.
         # Bu yüzden AGL'yi eksi (-) ile işleme alıyoruz ki mirror (ayna) efekti düzelsin.
-        raw_vo_z = self.z_offset - current_z_agl - self.initial_gps[2]
+        raw_vo_z = self.z_offset - current_z_agl - init_z
         
         # Dead Reckoning Sırasında Z Ekseni Asimetrik Düzeltmesi (Geometrik Drift Yaratmaz!)
         # Dron yükselirken (raw_vo_z azalır) optik akış asimetrik hata yapar ve over-estimate eder -> x0.6
@@ -310,10 +432,10 @@ class MonocularVO:
                 # daha fazla under-estimate edilir (az hesaplanır). 
                 # Bunu telafi etmek için dr_frame_count'a bağlı dinamik bir çarpan (1.0 -> 3.0) kullanıyoruz.
                 drift_compensation = min(self.dr_frame_count / 3000.0, 1.0)
-                dynamic_multiplier = 1.0 + drift_compensation * 2.0
+                dynamic_multiplier = 1.0 + drift_compensation * self.P["z_mult_down"]
                 corrected_delta_z = delta_z * dynamic_multiplier
             else:
-                corrected_delta_z = delta_z * 0.6  # Yükselmeyi / tepeyi küçült (bu iyi çalışıyordu)
+                corrected_delta_z = delta_z * self.P["z_mult_up"]  # Yükselmeyi / tepeyi küçült
                 
             self.t_f[2][0] = self.dr_start_z + corrected_delta_z
         else:
@@ -358,6 +480,11 @@ class MonocularVO:
             return 1.0
 
         score = 1.0
+
+        # Ölçek hiç öğrenilemediyse (GPS fazında yeterli hareket yoktu) konum
+        # tahmini varsayılan PPM/heading'e dayanır — güven ciddi şekilde düşmeli
+        if self.gps_motion_total < self.SCALE_LEARN_MIN_DIST:
+            score *= 0.3
 
         if self.last_inlier_ratio < self.THRESH_INLIER_RATIO:
             score *= (self.last_inlier_ratio / self.THRESH_INLIER_RATIO) * 0.5
@@ -419,6 +546,9 @@ class MonocularVO:
         else:
             self.dead_reckoning_active = True
             self.dr_frame_count += 1
+            # GPS yokken piksel birikimi anlamsız — sıfırla
+            self._acc_dx = self._acc_dy = 0.0
+            self._acc_start_gps = None
 
         if gps_healthy and self.initial_gps is None:
             self.initial_gps = (
@@ -470,7 +600,7 @@ class MonocularVO:
         m, inliers = cv2.estimateAffinePartial2D(
             px_cur_c, px_ref_c,
             method=cv2.RANSAC,
-            ransacReprojThreshold=1.5,
+            ransacReprojThreshold=self.P["ransac_reproj_threshold"],
             maxIters=2000,
             confidence=0.99
         )
@@ -532,7 +662,6 @@ class MonocularVO:
             ],
             "confidence": confidence,
             "is_reliable": (
-                confidence >= 0.4 and
                 self.last_inlier_ratio >= self.THRESH_INLIER_RATIO and
                 self.last_feature_count >= self.THRESH_MIN_FEATURES
             ),
@@ -542,6 +671,8 @@ class MonocularVO:
             "feature_count": self.last_feature_count,
             "heading_deg": round(heading_deg, 1) if heading_deg is not None else None,
             "accum_yaw_deg": round(math.degrees(self.accumulated_dr_yaw), 1),
+            "scale_learned": self.gps_motion_total >= self.SCALE_LEARN_MIN_DIST,
+            "chirality": int(self.chirality),
         }
 
 

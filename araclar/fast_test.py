@@ -4,7 +4,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
-from mono_vo import MonocularVO
+import sys, os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from vo.mono_vo import MonocularVO
 import time
 import math
 
@@ -412,6 +414,19 @@ def main():
     ax4.set_xlabel("X (m)")
     ax4.set_ylabel("Y (m)")
     ax4.set_zlabel("Z (m)")
+
+    # Eksenleri eşit ölçeklendir (en çok sapma yapan eksene göre)
+    all_x = np.concatenate([gt_x, pred_x])
+    all_y = np.concatenate([gt_y, pred_y])
+    all_z = np.concatenate([gt_z, pred_z])
+    max_range = np.array([all_x.max()-all_x.min(), all_y.max()-all_y.min(), all_z.max()-all_z.min()]).max() / 2.0
+    mid_x = (all_x.max()+all_x.min()) * 0.5
+    mid_y = (all_y.max()+all_y.min()) * 0.5
+    mid_z = (all_z.max()+all_z.min()) * 0.5
+    
+    ax4.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax4.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax4.set_zlim(mid_z - max_range, mid_z + max_range)
     if has_gps_reference:
         ax4.legend()
 

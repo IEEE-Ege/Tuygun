@@ -6,7 +6,7 @@ import mpl_toolkits.mplot3d.axes3d as p3
 
 def main():
     print("Veriler yükleniyor...")
-    df = pd.read_csv("trajectory_data.csv")
+    df = pd.read_csv("video_sistemi/cikti/trajectory_data.csv")
     
     # Animasyonu hızlandırmak ve dosya boyutunu küçültmek için subsample (her 10 karede bir)
     subsample = 10
@@ -25,10 +25,15 @@ def main():
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
     
-    # Eksen sınırlarını ayarla (tüm rotayı kapsayacak şekilde)
-    ax.set_xlim(min(np.min(gt_x), np.min(pred_x)) - 10, max(np.max(gt_x), np.max(pred_x)) + 10)
-    ax.set_ylim(min(np.min(gt_y), np.min(pred_y)) - 10, max(np.max(gt_y), np.max(pred_y)) + 10)
-    ax.set_zlim(min(np.min(gt_z), np.min(pred_z)) - 5, max(np.max(gt_z), np.max(pred_z)) + 5)
+    # Her eksen kendi veri aralığına sıkı oturur (%5 marj); Z gibi dar
+    # eksenler en geniş eksene eşitlenip boş kalmaz.
+    all_x = np.concatenate([gt_x, pred_x])
+    all_y = np.concatenate([gt_y, pred_y])
+    all_z = np.concatenate([gt_z, pred_z])
+    for setter, vals in ((ax.set_xlim, all_x), (ax.set_ylim, all_y), (ax.set_zlim, all_z)):
+        lo, hi = vals.min(), vals.max()
+        pad = max((hi - lo) * 0.05, 1.0)
+        setter(lo - pad, hi + pad)
     
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
@@ -38,6 +43,12 @@ def main():
     # Tüm rotayı soluk çiz (arkaplan)
     ax.plot(gt_x, gt_y, gt_z, color='blue', alpha=0.2, linestyle=':')
     ax.plot(pred_x, pred_y, pred_z, color='red', alpha=0.2, linestyle=':')
+
+    # GPS kesinti noktası (orijinal kare 450 → subsample sonrası indeks)
+    cut_idx = 450 // subsample
+    if cut_idx < n_frames:
+        ax.scatter(gt_x[cut_idx], gt_y[cut_idx], gt_z[cut_idx],
+                   color='green', s=120, zorder=5, label='GPS Kesintisi')
     
     # Hareket eden objeler (dronlar)
     gt_point, = ax.plot([], [], [], 'bo', markersize=8, label='Gerçek Rota (GT)')
@@ -95,8 +106,8 @@ def main():
     ani = FuncAnimation(fig, update, frames=n_frames, interval=33, blit=False)
     
     writer = FFMpegWriter(fps=30, metadata=dict(artist='Tuygun'), bitrate=1800)
-    ani.save("3d_animation.mp4", writer=writer)
-    print("Animasyon 3d_animation.mp4 olarak kaydedildi!")
+    ani.save("video_sistemi/cikti/3d_animation.mp4", writer=writer)
+    print("Animasyon video_sistemi/cikti/3d_animation.mp4 olarak kaydedildi!")
 
 if __name__ == "__main__":
     main()
